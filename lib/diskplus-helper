@@ -645,6 +645,101 @@ SECTOR = 512
 ALIGN = 2048
 
 
+SHRINKERS = {"ntfs", "ext2", "ext3", "ext4"}      # файловые системы, которые умеем уменьшать (во временном файле)
+CLOC = dict(os.environ, LC_ALL="C", LANG="C")
+
+
+def fs_min_size(node, fs):
+    """Минимальный размер файловой системы в байтах (источник только читается) -> (байты|None, причина)."""
+    try:
+        if fs == "ntfs":
+            p = subprocess.run(["ntfsresize", "--info", "-f", node], capture_output=True, text=True, timeout=180, env=CLOC)
+            m = re.search(r"resize at (\d+) bytes", p.stdout)
+            if m:
+                return int(m.group(1)), ""
+            tail = [x for x in (p.stdout + p.stderr).splitlines() if x.strip()]
+            return None, (tail[-1][:160] if tail else "ntfsresize не смог оценить размер")
+        if fs in ("ext2", "ext3", "ext4"):
+            p = subprocess.run(["resize2fs", "-P", node], capture_output=True, text=True, timeout=180, env=CLOC)
+            m = re.search(r"minimum size of the filesystem:\s*(\d+)", p.stdout)
+            t = subprocess.run(["tune2fs", "-l", node], capture_output=True, text=True, timeout=60, env=CLOC)
+            b = re.search(r"Block size:\s*(\d+)", t.stdout)
+            if m and b:
+                return int(m.group(1)) * int(b.group(1)), ""
+            return None, "resize2fs не смог оценить размер"
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    return None, "эта файловая система не уменьшается"
+
+
+def shrink_floor(min_bytes, size_sectors):
+    """Наименьший безопасный размер раздела (секторов): минимум + запас max(32 МиБ, 5 %), с выравниванием 1 МиБ."""
+    margin = max(32 * 2**20, int(min_bytes * 0.05))
+    sec = -(-(min_bytes + margin) // SECTOR)
+    sec = -(-sec // ALIGN) * ALIGN
+    return min(sec, size_sectors)
+
+
+def default_staging():
+    own = invoking_owner()
+    if own:
+        try:
+            return os.path.join(pwd.getpwuid(own[0]).pw_dir, ".cache", "disk-plus", "staging")
+        except KeyError:
+            pass
+    return None
+
+
+def check_staging(path, dst, src_disk, used_total):
+    """Папка для временных файлов уменьшения: разрешённое место, не на источнике/назначении, хватает места."""
+    problems = []
+    path = path or default_staging()
+    if not path or not os.path.isabs(path) or "\0" in path:
+        return None, ["Не удалось определить папку для временных файлов"]
+    path = os.path.normpath(path)
+    if not (path + "/").startswith(SAFE_DEST_PREFIXES):
+        return None, ["Временные файлы можно держать только в /home, /run/media, /mnt или /media"]
+    try:
+        os.makedirs(path, exist_ok=True)
+        own = invoking_owner()
+        if own:
+            os.chown(path, own[0], own[1])
+    except OSError as e:
+        return None, [f"Папка для временных файлов недоступна: {e.strerror}"]
+    dev = backing_disk_of_path(path)
+    if dev:
+        anc = disk_ancestors(dev)
+        if anc & disk_ancestors(dst):
+            problems.append("Папка для временных файлов находится на диске назначения: выберите другую")
+        if src_disk and anc & disk_ancestors(src_disk):
+            problems.append("Папка для временных файлов находится на исходном диске: выберите другую")
+    need = int(used_total * 1.1) + 256 * 2**20
+    free = shutil.disk_usage(path).free
+    if free < need:
+        problems.append(f"Для временных файлов нужно ≈ {need // 2**20} МиБ свободного места, а есть {free // 2**20} МиБ ({path})")
+    return path, problems
+
+
+def ntfs_fix_tail(node):
+    """У NTFS резервная копия загрузочного сектора должна лежать в последнем секторе раздела, а partclone её не переносит."""
+    try:
+        with open(node, "r+b") as f:
+            bs = f.read(512)
+            if bs[3:11] != b"NTFS    ":
+                return
+            total = struct.unpack_from("<Q", bs, 0x28)[0]
+            f.seek(0, 2)
+            sectors = f.tell() // 512
+            for sec in {total, sectors - 1}:
+                if 0 < sec < sectors:
+                    f.seek(sec * 512)
+                    f.write(bs)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
 def lsblk_node(dev):
     p = subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS,PARTUUID", dev],
                        capture_output=True, text=True, timeout=20)
@@ -730,8 +825,24 @@ def check_clone(req):
         fs = fs_of.get(node, "")
         if start % ALIGN or start < ALIGN:
             problems.append(f"Раздел {i + 1}: начало должно быть кратно 1 МиБ (сектор {start})")
+        shrink, used = False, 0
         if size < sp["size"]:
-            problems.append(f"Раздел {i + 1}: уменьшать раздел нельзя (было {sp['size'] * SECTOR // 2**20} МиБ)")
+            if fs == "swap":
+                pass      # раздел подкачки просто создаётся заново нужного размера
+            elif fs not in SHRINKERS:
+                problems.append(f"Раздел {i + 1}: файловую систему «{fs or 'неизвестно'}» уменьшить нельзя (умею NTFS и ext2/3/4)")
+            elif mnt_of.get(node):
+                problems.append(f"Раздел {i + 1}: примонтирован, уменьшать его нельзя")
+            else:
+                mn, why = fs_min_size(node, fs)
+                if mn is None:
+                    problems.append(f"Раздел {i + 1}: не удалось оценить минимальный размер ({why})")
+                else:
+                    floor = shrink_floor(mn, sp["size"])
+                    if size < floor:
+                        problems.append(f"Раздел {i + 1}: слишком мал, минимум {floor * SECTOR // 2**20} МиБ (занято {mn // 2**20} МиБ)")
+                    else:
+                        shrink, used = True, mn
         if start < last_end:
             problems.append(f"Раздел {i + 1}: пересекается с предыдущим")
         if start + size > usable_end:
@@ -748,13 +859,23 @@ def check_clone(req):
         grow = size > sp["size"]
         if grow and fs not in GROWERS and fs != "swap":
             warnings.append(f"Раздел {node}: файловая система «{fs or 'неизвестно'}» не расширяется, лишнее место останется неразмеченным внутри раздела")
+        if shrink and fs == "ntfs":
+            warnings.append(f"Раздел {node}: после уменьшения Windows при первой загрузке проверит том (chkdsk), это нормально")
+        if shrink and fs == "swap":
+            shrink = False
         plan.append({"src": node, "start": start, "size": size, "fs": fs, "method": method, "grow": grow and fs in GROWERS,
+                     "shrink": shrink, "used": used,
                      "type": sp.get("type"), "uuid": sp.get("uuid"), "name": sp.get("name", ""), "bootable": bool(sp.get("bootable")),
                      "src_size": sp["size"]})
     if not req.get("new_ids") and any(p["fs"] in ("btrfs", "ext2", "ext3", "ext4", "xfs") for p in plan):
         warnings.append("У клона будут те же идентификаторы (UUID), что у оригинала. Не подключайте оригинал и клон одновременно или включите «Новые идентификаторы».")
+    staging = None
+    used_total = sum(p["used"] for p in plan if p["shrink"])
+    if used_total:
+        staging, sp_problems = check_staging(req.get("staging"), dst, src, used_total)
+        problems += sp_problems
     return {"problems": problems, "warnings": warnings, "plan": plan, "label": label, "src": src, "dst": dst,
-            "label_id": table.get("id"), "dst_sectors": d_sectors}
+            "label_id": table.get("id"), "dst_sectors": d_sectors, "staging": staging, "used_total": used_total}
 
 
 def sfdisk_script(chk, new_ids):
@@ -778,6 +899,10 @@ def sfdisk_script(chk, new_ids):
 def clone_steps(chk, verify):
     steps = ["Подготовка диска назначения", "Создание таблицы разделов"]
     for i, p in enumerate(chk["plan"], 1):
+        if p.get("shrink"):
+            steps += [f"Раздел {i}: копирование во временный файл", f"Раздел {i}: уменьшение файловой системы",
+                      f"Раздел {i}: запись на диск"]
+            continue
         steps.append(f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else ""))
         if p["grow"]:
             steps.append(f"Раздел {i}: расширение файловой системы")
@@ -807,6 +932,7 @@ class Clone(threading.Thread):
         self.step = -1
         self.steps = clone_steps(chk, self.verify)
         self.procs = []
+        self.staging = chk.get("staging")
 
     def stop(self):
         self.stop_flag.set()
@@ -960,7 +1086,45 @@ class Clone(threading.Thread):
             shutil.rmtree(self.tmp, ignore_errors=True)
         send({"id": self.rid, "ev": "done", "reason": reason, "error": err, "warnings": self.warnings})
 
+    def stage_one(self, i, p, tmp):
+        """Шаг 1 уменьшения: развернуть раздел источника во временный (разреженный) файл исходного размера."""
+        with open(tmp, "wb") as f:
+            f.truncate(p["src_size"] * SECTOR)
+        self.run_partclone(CLONERS[p["fs"]], p["src"], tmp, i)
+
+    def copy_shrunk(self, i, p, node):
+        """Уменьшение: раздел -> временный файл -> уменьшение ФС в файле -> запись в меньший раздел. Источник не меняется."""
+        fs, part_bytes = p["fs"], p["size"] * SECTOR
+        stage = tempfile.mkdtemp(prefix="dpstage-", dir=self.staging)
+        tmp = os.path.join(stage, f"part{i}.img")
+        try:
+            self.begin(f"Раздел {i}: копирование во временный файл")
+            if not self.dry:
+                self.stage_one(i, p, tmp)
+            self.end()
+            self.begin(f"Раздел {i}: уменьшение файловой системы")
+            if fs == "ntfs":
+                self.sh(["ntfsresize", "-f", "-P", "-s", str(part_bytes - SECTOR), tmp])
+            else:
+                self.sh(["e2fsck", "-f", "-p", tmp], ok=(0, 1))
+                self.sh(["resize2fs", tmp, f"{p['size']}s"])
+            if not self.dry:
+                os.truncate(tmp, part_bytes)
+            self.end()
+            self.begin(f"Раздел {i}: запись на диск")
+            self.run_partclone(CLONERS[fs], tmp, node, i, extra=["-I"] if fs == "ntfs" else [])
+            if fs == "ntfs" and not self.dry:
+                ntfs_fix_tail(node)
+            self.end()
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
     def copy_part(self, i, p, node):
+        if p.get("shrink"):
+            self.copy_shrunk(i, p, node)
+            if self.new_ids:
+                self.new_uuid(p["fs"], node)
+            return
         title = f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else "")
         self.begin(title)
         src = p["src"]
@@ -978,15 +1142,19 @@ class Clone(threading.Thread):
             self.run_partclone("partclone.dd", src, node, i)
         else:
             self.run_partclone(CLONERS[p["fs"]], src, node, i)
+        if p["fs"] == "ntfs" and not self.dry:
+            ntfs_fix_tail(node)
         self.end()
         if p["grow"]:
             self.begin(f"Раздел {i}: расширение файловой системы")
             self.grow(p["fs"], node)
+            if p["fs"] == "ntfs" and not self.dry:
+                ntfs_fix_tail(node)
             self.end()
         if self.new_ids:
             self.new_uuid(p["fs"], node)
 
-    def run_partclone(self, tool, src, dst, i):
+    def run_partclone(self, tool, src, dst, i, extra=()):
         status = os.path.join(self.tmp, f"pc{i}.json")
         log = os.path.join(self.tmp, f"pc{i}.log")
         rx = re.compile(r'"total_percent":\s*(\d+(?:[.,]\d+)?).*?"rate_bytes_per_sec":\s*(\d+).*?"remaining_sec":\s*(\d+)', re.S)
@@ -1004,7 +1172,7 @@ class Clone(threading.Thread):
                 except ValueError:
                     pass
 
-        cmd = [tool, "-b", "-s", src, "-O", dst, "-L", log, f"--json-status={status}", "-f", "1"]
+        cmd = [tool, "-b", *extra, "-s", src, "-O", dst, "-L", log, f"--json-status={status}", "-f", "1"]
         try:
             self.sh(cmd, poll=poll)
         except RuntimeError as e:
@@ -1255,7 +1423,8 @@ class Backup(Clone):
         i, fs, node = t["index"], t["fs"], t["node"]
         title = f"Раздел {i}: сжатие" + (f" ({fs})" if fs else "")
         self.begin(title)
-        rec = {"index": i, "node": node, "start": t["sp"]["start"], "size": t["sp"]["size"], "type": t["sp"].get("type"),
+        mn = fs_min_size(node, fs)[0] if fs in SHRINKERS else None
+        rec = {"index": i, "node": node, "start": t["sp"]["start"], "size": t["sp"]["size"], "type": t["sp"].get("type"), "min_bytes": mn or 0,
                "uuid": t["sp"].get("uuid"), "name": t["sp"].get("name", ""), "bootable": bool(t["sp"].get("bootable")),
                "fs": fs, "fs_uuid": t["c"].get("uuid") or "", "fs_label": t["c"].get("label") or "", "method": t["method"],
                "file": "", "bytes": 0, "sha256": ""}
@@ -1345,14 +1514,23 @@ def check_restore(req):
         start, size = int(rp.get("start", 0)), int(rp.get("size", 0))
         if start % ALIGN or start < ALIGN:
             problems.append(f"Раздел {n}: начало должно быть кратно 1 МиБ (сектор {start})")
+        fs = p.get("fs", "")
+        shrink, used = False, 0
         if size < p["size"]:
-            problems.append(f"Раздел {n}: уменьшать раздел нельзя (в копии {p['size'] * SECTOR // 2**20} МиБ)")
+            mn = p.get("min_bytes") or 0
+            if fs == "swap":
+                pass
+            elif fs not in SHRINKERS or not mn:
+                problems.append(f"Раздел {n}: уменьшать нельзя (в копии {p['size'] * SECTOR // 2**20} МиБ; в копии нет данных о минимальном размере)")
+            elif size < shrink_floor(mn, p["size"]):
+                problems.append(f"Раздел {n}: слишком мал, минимум {shrink_floor(mn, p['size']) * SECTOR // 2**20} МиБ")
+            else:
+                shrink, used = True, mn
         if start < last_end:
             problems.append(f"Раздел {n}: пересекается с предыдущим")
         if start + size > usable_end:
             problems.append(f"Раздел {n}: не помещается на диск назначения")
         last_end = start + size
-        fs = p.get("fs", "")
         if p.get("method") == "raw" and fs:
             warnings.append(f"Раздел {p['index']}: файловая система «{fs}» восстанавливается посекторно")
         grow = size > p["size"]
@@ -1363,11 +1541,18 @@ def check_restore(req):
             if not os.path.exists(fpath):
                 problems.append(f"Раздел {p['index']}: файл копии отсутствует")
         plan.append({"src": None, "file": p.get("file"), "start": start, "size": size, "fs": fs, "method": p.get("method", "raw"),
-                     "grow": grow and fs in GROWERS, "type": p.get("type"), "uuid": p.get("uuid"), "name": p.get("name", ""),
+                     "grow": grow and fs in GROWERS, "shrink": shrink, "used": used, "type": p.get("type"), "uuid": p.get("uuid"),
+                     "name": p.get("name", ""),
                      "bootable": bool(p.get("bootable")), "src_size": p["size"], "fs_uuid": p.get("fs_uuid", ""),
                      "fs_label": p.get("fs_label", ""), "index": p["index"]})
+    staging = None
+    used_total = sum(p["used"] for p in plan if p["shrink"])
+    if used_total:
+        staging, sp_problems = check_staging(req.get("staging"), dst, None, used_total)
+        problems += sp_problems
     return {"problems": problems, "warnings": warnings, "plan": plan, "label": label, "src": folder, "dst": dst,
-            "label_id": man["source"].get("label_id"), "dst_sectors": d_sectors, "manifest": man}
+            "label_id": man["source"].get("label_id"), "dst_sectors": d_sectors, "manifest": man,
+            "staging": staging, "used_total": used_total}
 
 
 class Restore(Clone):
@@ -1388,7 +1573,21 @@ class Restore(Clone):
             raise RuntimeError("копия повреждена: " + "; ".join(problems))
         self.end()
 
+    def stage_one(self, i, p, tmp):
+        """Шаг 1 уменьшения при восстановлении: поток из копии -> временный файл исходного размера."""
+        with open(tmp, "wb") as f:
+            f.truncate(p["src_size"] * SECTOR)
+        status = os.path.join(self.tmp, f"s{i}.json")
+        log = os.path.join(self.tmp, f"s{i}.log")
+        self.run_pipe(["zstd", "-dc", "-q", backup_member(self.folder, p["file"])],
+                      [CLONERS[p["fs"]], "-r", "-s", "-", "-O", tmp, "-L", log, f"--json-status={status}", "-f", "1"])
+
     def copy_part(self, i, p, node):
+        if p.get("shrink"):
+            self.copy_shrunk(i, p, node)
+            if self.new_ids:
+                self.new_uuid(p["fs"], node)
+            return
         title = f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else "")
         self.begin(title)
         m = p["method"]
@@ -1416,10 +1615,14 @@ class Restore(Clone):
 
             self.run_pipe(["zstd", "-dc", "-q", backup_member(self.folder, p["file"])],
                           [tool, "-r", "-s", "-", "-O", node, "-L", log, f"--json-status={status}", "-f", "1"], poll=poll)
+        if p["fs"] == "ntfs" and not self.dry:
+            ntfs_fix_tail(node)
         self.end()
         if p["grow"]:
             self.begin(f"Раздел {i}: расширение файловой системы")
             self.grow(p["fs"], node)
+            if p["fs"] == "ntfs" and not self.dry:
+                ntfs_fix_tail(node)
             self.end()
         if self.new_ids:
             self.new_uuid(p["fs"], node)
@@ -1455,6 +1658,30 @@ def handle(req):
             chk["steps"] = clone_steps(chk, bool(req.get("verify", True)))
             chk["script"] = sfdisk_script(chk, bool(req.get("new_ids")))
             send({"id": rid, "ev": "res", "data": chk})
+        elif cmd == "shrink_info":
+            dev = req.get("src")
+            if not isinstance(dev, str) or not WHOLE_DISK_RE.match(dev):
+                raise BadRequest("нужен весь диск")
+            dev = check_dev(dev)
+            node = lsblk_node(dev)
+            out = []
+            for c in node.get("children") or []:
+                fs = c.get("fstype") or ""
+                size_sec = int(c["size"]) // SECTOR
+                info = {"node": c["path"], "fs": fs, "size": size_sec, "min": None, "reason": ""}
+                if fs in SHRINKERS and not mounts_of(c):
+                    mn, why = fs_min_size(c["path"], fs)
+                    if mn is not None:
+                        info["min"] = shrink_floor(mn, size_sec)
+                        info["used"] = mn
+                    else:
+                        info["reason"] = why
+                elif fs in SHRINKERS:
+                    info["reason"] = "примонтирован"
+                else:
+                    info["reason"] = "не уменьшается"
+                out.append(info)
+            send({"id": rid, "ev": "res", "data": {"parts": out, "staging": default_staging()}})
         elif cmd == "backup":
             if any(s.is_alive() for s in scans.values()):
                 raise BadRequest("другая операция уже выполняется")

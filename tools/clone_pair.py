@@ -21,7 +21,7 @@ def up():
     os.makedirs(WORK, exist_ok=True)
     src, dst = os.path.join(WORK, "src.img"), os.path.join(WORK, "dst.img")
     sh("truncate", "-s", "300M", src)
-    sh("truncate", "-s", "900M", dst)
+    sh("truncate", "-s", os.environ.get("DISKPLUS_PAIR_DST", "900M"), dst)
     S = sh("losetup", "-fP", "--show", src).strip()
     D = sh("losetup", "-fP", "--show", dst).strip()
     sh("sfdisk", "-q", S, input='label: gpt\nstart=2048, size=131072, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI"\n'

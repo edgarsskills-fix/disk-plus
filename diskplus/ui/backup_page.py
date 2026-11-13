@@ -380,6 +380,10 @@ class BackupPage(Gtk.Box):
         for p in m["partitions"]:
             sp = planmod.SrcPart(str(p["index"]), p["index"], p["start"], p["size"], p.get("type") or "", p.get("name", ""),
                                  p.get("fs", ""), p.get("fs_label", ""), [])
+            if p.get("min_bytes"):       # минимальный размер записан в копии при её создании
+                sp.used = p["min_bytes"]
+                margin = max(32 * 2**20, int(p["min_bytes"] * 0.05))
+                sp.min_size = min(planmod.align_up((p["min_bytes"] + margin) // 512 + 1), p["size"])
             parts.append(sp)
         self.r_src_parts = parts
         for r in self._r_rows:
@@ -420,7 +424,8 @@ class BackupPage(Gtk.Box):
     def _r_apply(self):
         if not self.layout:
             return
-        {0: self.layout.mode_stretch_largest, 1: self.layout.mode_asis, 2: self.layout.mode_proportional}[self.r_mode.get_selected()]()
+        {0: self.layout.mode_auto, 1: self.layout.mode_asis, 2: self.layout.mode_stretch_largest,
+         3: self.layout.mode_proportional}[self.r_mode.get_selected()]()
         self._r_refresh()
 
     def _r_drag(self, idx, new_size):

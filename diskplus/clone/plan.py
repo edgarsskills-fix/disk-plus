@@ -25,6 +25,13 @@ class SrcPart:
     fs: str = ""
     label: str = ""
     mounts: list = field(default_factory=list)
+    min_size: int = 0          # секторов: до скольки можно уменьшить (0 = нельзя)
+    used: int = 0              # байт занято (оценка)
+
+    @property
+    def floor(self) -> int:
+        """Наименьший допустимый размер раздела в клоне."""
+        return self.min_size if 0 < self.min_size < self.size else self.size
 
     @property
     def mib(self) -> int:
@@ -93,14 +100,15 @@ class Layout:
         return self.end <= self.usable_end
 
     def min_total(self) -> int:
-        return ALIGN + sum(align_up(p.src.size) for p in self.enabled())
+        """Наименьший диск, на который всё поместится (с уменьшением там, где возможно)."""
+        return ALIGN + sum(align_up(p.src.floor) for p in self.enabled())
 
     def resize(self, idx: int, new_size: int) -> int:
         """Изменить размер раздела idx; возвращает фактический размер (в пределах [оригинал, остаток диска])."""
         p = self.parts[idx]
         others = sum(align_up(q.size) for q in self.enabled() if q is not p)
         room = self.usable_end - ALIGN - others
-        new_size = max(p.src.size, min(align_up(new_size), room - room % ALIGN if room > 0 else p.src.size))
+        new_size = max(p.src.floor, min(align_up(new_size), room - room % ALIGN if room > 0 else p.src.floor))
         p.size = new_size
         self.recalc()
         return new_size
@@ -120,6 +128,35 @@ class Layout:
             room = self.usable_end - ALIGN - others
             en[-1].size = max(en[-1].src.size, room - room % ALIGN)
             self.recalc()
+
+    def mode_auto(self):
+        """Если всё помещается как есть — растянуть основной раздел; иначе уменьшить разделы, которые умеют уменьшаться,
+        пропорционально их «запасу» (размер минус минимум), чтобы всё уместилось."""
+        self.mode_asis()
+        if self.fits:
+            self.mode_stretch_largest()
+            return
+        need = self.end - self.usable_end
+        en = self.enabled()
+        slack = {id(p): max(p.src.size - p.src.floor, 0) for p in en}
+        total_slack = sum(slack.values())
+        if total_slack <= 0:
+            return
+        cut_left = min(need, total_slack)
+        for p in en:
+            share = int(cut_left * slack[id(p)] / total_slack)
+            share -= share % ALIGN
+            p.size = max(p.src.floor, p.src.size - share)
+        self.recalc()
+        # добираем остаток, если округление оставило нехватку
+        for p in sorted(en, key=lambda q: q.size - q.src.floor, reverse=True):
+            while not self.fits and p.size - ALIGN >= p.src.floor:
+                p.size -= ALIGN
+                self.recalc()
+
+    def shrunk(self):
+        """Разделы, которые будут уменьшены: [(PlanPart, было, станет)]"""
+        return [(p, p.src.size, p.size) for p in self.enabled() if p.size < p.src.size]
 
     def mode_stretch_largest(self):
         """Все разделы как есть, самый большой растягивается на всё свободное место (для Windows это C:, а не «Восстановление»)."""

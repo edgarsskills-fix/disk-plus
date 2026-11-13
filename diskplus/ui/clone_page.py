@@ -14,7 +14,7 @@ from ..clone import plan as planmod  # noqa: E402
 from .layout_bar import LayoutBar, Seg  # noqa: E402
 from .widgets import SmoothBar  # noqa: E402
 
-MODES = ["Растянуть основной (самый большой) раздел", "Как есть, без изменения размеров", "Распределить пропорционально"]
+MODES = ["Автоматически (уместить или растянуть)", "Как есть, без изменения размеров", "Растянуть основной раздел", "Распределить пропорционально"]
 STATE_ICON = {"running": None, "done": "object-select-symbolic", "warn": "dialog-warning-symbolic",
               "error": "dialog-error-symbolic", "wait": "content-loading-symbolic"}
 
@@ -212,14 +212,42 @@ class ClonePage(Gtk.Box):
         if not self.src_parts or self.label not in ("gpt", "dos"):
             self.window.toast("На исходном диске нет таблицы разделов GPT или MBR: такой диск пока нельзя клонировать")
             return
+        self.next_btn.set_sensitive(False)
+        self.next_btn.set_label("Считаю минимальные размеры…")
+
+        def ready():
+            def got(msg):
+                self.next_btn.set_sensitive(True)
+                self.next_btn.set_label("Далее: раскладка")
+                if msg.get("ev") == "res":
+                    self.staging = msg["data"].get("staging")
+                    by = {p["node"]: p for p in msg["data"]["parts"]}
+                    for sp in self.src_parts:
+                        info = by.get(sp.node)
+                        if info and info.get("min"):
+                            sp.min_size, sp.used = info["min"], info.get("used", 0)
+                self._build_layout_view()
+
+            self.store.helper.request("shrink_info", got, src=self.src.path)
+
+        def failed(msg):
+            self.next_btn.set_sensitive(True)
+            self.next_btn.set_label("Далее: раскладка")
+            self.window.toast(msg + ". Без доступа раздел уменьшить не получится.")
+            self._build_layout_view()
+
+        self.store.ensure_helper(ready, failed)
+
+    def _build_layout_view(self):
         self.layout = planmod.Layout(self.src_parts, self.dst.size // 512, self.label)
         for r in self._part_rows:
             self.part_group.remove(r)
         self._part_rows = []
         for sp in self.src_parts:
             nm = sp.label or sp.name or ""
+            extra = f" · можно уменьшить до {devices.human_size(sp.floor * 512)}" if sp.floor < sp.size else ""
             row = Adw.SwitchRow(title=f"Раздел {sp.number}: {sp.fs or 'без файловой системы'}" + (f" · {nm}" if nm else ""),
-                                subtitle=devices.human_size(sp.size * 512) + (f" · примонтирован ({', '.join(sp.mounts)})" if sp.mounts else ""),
+                                subtitle=devices.human_size(sp.size * 512) + extra + (f" · примонтирован ({', '.join(sp.mounts)})" if sp.mounts else ""),
                                 active=True)
             row.connect("notify::active", lambda r, _p, sp=sp: self._toggle_part(sp, r.get_active()))
             self.part_group.add(row)
@@ -241,7 +269,8 @@ class ClonePage(Gtk.Box):
         if not self.layout:
             return
         m = self.mode_row.get_selected()
-        {0: self.layout.mode_stretch_largest, 1: self.layout.mode_asis, 2: self.layout.mode_proportional}[m]()
+        {0: self.layout.mode_auto, 1: self.layout.mode_asis, 2: self.layout.mode_stretch_largest,
+         3: self.layout.mode_proportional}[m]()
         self._refresh_bar()
 
     def _on_drag(self, idx_enabled, new_size):
@@ -262,9 +291,14 @@ class ClonePage(Gtk.Box):
         self.dst_bar.set_data(L.target, segs)
         free = max(L.free, 0)
         txt = f"Занято {devices.human_size((L.end) * 512)} из {devices.human_size(L.target * 512)}, свободно {devices.human_size(free * 512)}."
+        shr = L.shrunk()
+        if shr:
+            txt += "\nБудут уменьшены: " + "; ".join(f"раздел {p.src.number} ({p.src.fs}) {devices.human_size(a * 512)} → {devices.human_size(b * 512)}" for p, a, b in shr) \
+                   + ".\nФайловая система сначала уменьшается в временном файле (понадобится свободное место на другом диске), исходный диск не меняется."
         ok = L.fits and bool(L.enabled())
         if not L.fits:
-            txt = f"Не помещается: нужно минимум {devices.human_size(L.min_total() * 512)}, а диск {devices.human_size(L.target * 512)}. Отключите часть разделов."
+            txt = (f"Не помещается: даже с уменьшением нужно минимум {devices.human_size(L.min_total() * 512)}, "
+                   f"а диск {devices.human_size(L.target * 512)}. Отключите часть разделов или выберите диск побольше.")
         elif not L.enabled():
             txt = "Не выбран ни один раздел"
         self.sum_lbl.set_label(txt)
@@ -276,7 +310,8 @@ class ClonePage(Gtk.Box):
     # ------------------------------------------------------------ проверка плана и подтверждение
     def _request_args(self):
         return dict(src=self.src.path, dst=self.dst.path, parts=self.layout.to_request(),
-                    new_ids=self.newid_row.get_active(), verify=self.verify_row.get_active())
+                    new_ids=self.newid_row.get_active(), verify=self.verify_row.get_active(),
+                    **({"staging": self.staging_dir} if getattr(self, "staging_dir", None) else {}))
 
     def check_plan(self):
         self.go_btn.set_sensitive(False)
@@ -310,7 +345,9 @@ class ClonePage(Gtk.Box):
 
     def confirm(self):
         name = os.path.basename(self.dst.path)
-        parts = "\n".join(f"  • раздел {p.src.number} ({p.src.fs or '—'}): {devices.human_size(p.size * 512)}" for p in self.layout.enabled())
+        parts = "\n".join(f"  • раздел {p.src.number} ({p.src.fs or '—'}): {devices.human_size(p.size * 512)}"
+                          + (f"  (уменьшается с {devices.human_size(p.src.size * 512)})" if p.size < p.src.size else "")
+                          for p in self.layout.enabled())
         body = (f"Диск назначения будет ПОЛНОСТЬЮ СТЁРТ:\n{self.dst.title}\n{self.dst.path} · {devices.human_size(self.dst.size)}"
                 + (f" · серийный № {self.dst.serial}" if self.dst.serial else "")
                 + f"\n\nНа него запишется копия диска «{self.src.title}»:\n{parts}\n\n"

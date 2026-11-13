@@ -215,7 +215,7 @@ class App(Adw.Application):
             (2000, setup),
             (800, lambda: self.shot("c1-pick")),
             (200, cp.to_layout),
-            (1200, lambda: self.shot("c2-layout")),
+            (3500, lambda: self.shot("c2-layout")),
             (200, drag),
             (800, lambda: self.shot("c3-dragged")),
             (200, cp.check_plan),
