@@ -22,7 +22,7 @@ AUTOTEST = os.environ.get("DISKPLUS_AUTOTEST", "")
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        super().__init__(application_id=os.environ.get("DISKPLUS_APP_ID") or APP_ID)    # отдельный id нужен только автотестам
         self.store = Store()
         self.win = None
 
@@ -38,6 +38,10 @@ class App(Adw.Application):
             self.win = MainWindow(self, self.store)
             self.win.connect("close-request", self._close)
             self.store.refresh_disks()
+        size = os.environ.get("DISKPLUS_SIZE")      # только для автотестов: например 1920x1000
+        if size:
+            wd, ht = (int(v) for v in size.split("x"))
+            self.win.set_default_size(wd, ht)
         self.win.present()
         if SHOT:
             self.win.stack.set_transition_type(Gtk.StackTransitionType.NONE)

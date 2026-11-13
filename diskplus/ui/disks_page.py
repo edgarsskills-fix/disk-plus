@@ -146,8 +146,20 @@ class DisksPage(Gtk.Box):
             getattr(self.flow, f"set_margin_{m}")(18)
         sc.set_child(self.flow)
         self.append(sc)
+        self.sc = sc
+        sc.get_hadjustment().connect("notify::page-size", lambda *_: self._fit_columns())
         store.connect(self._on_event)
         self.rebuild()
+
+    CARD_MIN = 400      # минимальная ширина карточки, px
+
+    def _fit_columns(self):
+        """Колонок столько, сколько помещается при минимальной ширине карточки; карточки заполняют колонки без пустот."""
+        width = self.sc.get_hadjustment().get_page_size() - 36      # поля вокруг сетки
+        cols = max(1, min(4, int((width + 16) // (self.CARD_MIN + 16))))
+        if self.flow.get_max_children_per_line() != cols:
+            self.flow.set_min_children_per_line(cols)
+            self.flow.set_max_children_per_line(cols)
 
     def grant(self):
         self.banner.set_button_label("Ожидаю подтверждения…")
@@ -170,9 +182,8 @@ class DisksPage(Gtk.Box):
         for d in self.store.disks:
             card = DiskCard(self, d)
             self.cards[d.path] = card
-            clamp = Adw.Clamp(maximum_size=460, tightening_threshold=340)   # ограничивает ширину карточки: иначе сетка не соберётся
-            clamp.set_child(card)
-            self.flow.append(clamp)
+            card.set_hexpand(True)
+            self.flow.append(card)
 
     def open_smart(self, disk):
         if not self.store.helper_ready:
