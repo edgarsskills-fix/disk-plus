@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Disk++
+GenericName=Работа с дисками
+Comment=Проверка дисков, спасение данных, клонирование и бэкапы
+Exec=disk-plus
+Icon=com.local.DiskPlus
+Terminal=false
+Categories=System;Filesystem;
+Keywords=disk;диск;smart;victoria;виктория;recovery;восстановление;clone;клонирование;ddrescue;
+StartupNotify=true
+StartupWMClass=com.local.DiskPlus

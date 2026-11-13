@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.local.DiskPlus</id>
+  <name>Disk++</name>
+  <summary>Проверка дисков, спасение данных, клонирование и бэкапы</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Disk++ объединяет в одном окне диагностику накопителей (SMART и сканирование поверхности),
+    снятие образа с повреждённого диска, восстановление файлов и клонирование дисков.</p>
+  </description>
+  <launchable type="desktop-id">com.local.DiskPlus.desktop</launchable>
+  <url type="homepage">https://github.com/edgarsskills-fix/disk-plus</url>
+  <provides><binary>disk-plus</binary></provides>
+</component>

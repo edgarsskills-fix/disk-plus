@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+import os
+import sys
+
+for base in (os.environ.get("DISKPLUS_LIB"), "/usr/lib/disk-plus"):
+    if base and os.path.isdir(os.path.join(base, "diskplus")):
+        sys.path.insert(0, base)
+        break
+from diskplus.app import main  # noqa: E402
+
+sys.exit(main(sys.argv))

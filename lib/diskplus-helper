@@ -1,0 +1,1531 @@
+#!/usr/bin/python3 -I
+"""Disk++ — привилегированный помощник.
+
+Запускается через pkexec (polkit) и общается с интерфейсом JSON-строками:
+  stdin : {"id": N, "cmd": "...", ...}
+  stdout: {"id": N, "ev": "res"|"err"|"progress"|"done", ...}
+
+Принципы безопасности:
+  * диски открываются ТОЛЬКО на чтение (O_RDONLY), команд записи нет вообще;
+  * принимаются только пути вида /dev/sdX, /dev/nvmeXnY(pZ), /dev/mapper/..., и только блочные устройства;
+  * набор команд закрытый (hello, smart, selftest, scan, pause, resume, stop);
+  * никакого произвольного запуска программ.
+Файл должен принадлежать root и не быть доступным на запись обычному пользователю.
+"""
+import bisect
+import fcntl
+import hashlib
+import json
+import mmap
+import os
+import pwd
+import re
+import shutil
+import signal
+import tempfile
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = 1
+DEV_RE = re.compile(
+    r"^/dev/(sd[a-z]+\d*|vd[a-z]+\d*|hd[a-z]+\d*|nvme\d+n\d+(p\d+)?|mmcblk\d+(p\d+)?|"
+    r"loop\d+(p\d+)?|dm-\d+|mapper/[A-Za-z0-9_.+-]+)$"
+)
+
+_out_lock = threading.Lock()
+
+
+def send(obj):
+    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    with _out_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+class BadRequest(Exception):
+    pass
+
+
+def check_dev(path):
+    if not isinstance(path, str) or not DEV_RE.match(path):
+        raise BadRequest("недопустимый путь устройства")
+    real = os.path.realpath(path)
+    if not DEV_RE.match(real) and not real.startswith("/dev/dm-"):
+        raise BadRequest("недопустимое устройство")
+    try:
+        mode = os.stat(real).st_mode
+    except OSError as e:
+        raise BadRequest(f"устройство недоступно: {e.strerror}")
+    if not stat.S_ISBLK(mode):
+        raise BadRequest("это не блочное устройство")
+    return real
+
+
+def logical_sector(fd):
+    """Логический размер сектора (512 или 4096) через BLKSSZGET."""
+    try:
+        return struct.unpack("i", fcntl.ioctl(fd, 0x1268, b"\0\0\0\0"))[0] or 512
+    except OSError:
+        return 512
+
+
+def block_size_of(fd):
+    """Размер блочного устройства в байтах."""
+    return os.lseek(fd, 0, os.SEEK_END)
+
+
+# --------------------------------------------------------------------------- SMART
+
+def run_smartctl(args, dev):
+    p = subprocess.run(["smartctl", "-j", *args, dev], capture_output=True, text=True, timeout=60)
+    try:
+        data = json.loads(p.stdout) if p.stdout.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+    return p.returncode, data
+
+
+def has_smart_data(data):
+    return bool(
+        data.get("ata_smart_attributes")
+        or data.get("nvme_smart_health_information_log")
+        or data.get("scsi_error_counter_log")
+        or "smart_status" in data
+    )
+
+
+def cmd_smart(req):
+    dev = check_dev(req.get("dev"))
+    dtype = req.get("dtype")
+    tried = []
+    candidates = [dtype] if dtype else [None, "sat", "sat,auto"]
+    best = None
+    for d in candidates:
+        args = ["-a"] + (["-d", d] if d else [])
+        try:
+            rc, data = run_smartctl(args, dev)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            tried.append(f"{d or 'auto'}: {e}")
+            continue
+        tried.append(d or "auto")
+        if best is None:
+            best = (rc, data, d)
+        if has_smart_data(data):
+            return {"rc": rc, "dtype": d, "smart": data}
+    if best is None:
+        raise BadRequest("smartctl не запустился (установлен ли smartmontools?)")
+    rc, data, d = best
+    return {"rc": rc, "dtype": d, "smart": data, "unavailable": True}
+
+
+def cmd_selftest(req):
+    dev = check_dev(req.get("dev"))
+    kind = req.get("kind")
+    if kind not in ("short", "long", "abort"):
+        raise BadRequest("неизвестный тип теста")
+    args = ["-X"] if kind == "abort" else ["-t", kind]
+    if req.get("dtype"):
+        args += ["-d", req["dtype"]]
+    p = subprocess.run(["smartctl", *args, dev], capture_output=True, text=True, timeout=60)
+    return {"rc": p.returncode, "text": p.stdout[-2000:]}
+
+
+# --------------------------------------------------------------------------- Скан поверхности
+
+class Scan(threading.Thread):
+    """Линейное чтение устройства с замером времени каждого блока (как в Виктории,
+    но только чтение: ничего не пишется и не переназначается)."""
+
+    def __init__(self, rid, req):
+        super().__init__(daemon=True)
+        self.rid = rid
+        self.dev = check_dev(req.get("dev"))
+        self.block = int(req.get("block", 131072))
+        if self.block < 4096 or self.block > 64 * 1024 * 1024 or self.block % 4096:
+            raise BadRequest("недопустимый размер блока")
+        self.start_b = int(req.get("start", 0))
+        self.end_b = req.get("end")
+        self.th = [float(x) for x in req.get("th", [5, 20, 50, 150, 500])]
+        if len(self.th) != 5 or self.th != sorted(self.th):
+            raise BadRequest("недопустимые пороги")
+        self.max_cells = max(100, min(int(req.get("cells", 20000)), 100000))
+        self.reverse = bool(req.get("reverse", False))
+        self.stop_flag = threading.Event()
+        self.run_flag = threading.Event()
+        self.run_flag.set()
+
+    def stop(self):
+        self.stop_flag.set()
+        self.run_flag.set()
+
+    def pause(self):
+        self.run_flag.clear()
+
+    def resume(self):
+        self.run_flag.set()
+
+    def run(self):
+        reason = "finished"
+        buckets = [0] * 7
+        done_bytes = 0
+        try:
+            try:
+                fd = os.open(self.dev, os.O_RDONLY | os.O_DIRECT)
+                direct = True
+            except OSError:
+                fd = os.open(self.dev, os.O_RDONLY)
+                direct = False
+            try:
+                size = block_size_of(fd)
+                sector = logical_sector(fd)
+                start = self.start_b - self.start_b % sector
+                end = size if self.end_b in (None, 0) else min(int(self.end_b), size)
+                end -= end % 512
+                if end <= start:
+                    raise BadRequest("пустой диапазон")
+                total = end - start
+                nblocks = (total + self.block - 1) // self.block
+                cells = min(nblocks, self.max_cells)
+                send({"id": self.rid, "ev": "start", "total": total, "blocks": nblocks, "cells": cells,
+                      "direct": direct, "size": size, "start": start, "end": end})
+                buf = mmap.mmap(-1, self.block)
+                view = memoryview(buf)
+                cell_code = bytearray([255]) * cells   # 255 = ещё не читали
+                dirty_lo, dirty_hi = None, None
+                log = []
+                t_last = time.perf_counter()
+                bytes_last = 0
+                t_begin = t_last
+                order = range(nblocks - 1, -1, -1) if self.reverse else range(nblocks)
+                th = self.th
+                for i in order:
+                    if self.stop_flag.is_set():
+                        reason = "stopped"
+                        break
+                    if not self.run_flag.is_set():
+                        self.run_flag.wait()
+                        t_last = time.perf_counter()
+                        bytes_last = done_bytes
+                        if self.stop_flag.is_set():
+                            reason = "stopped"
+                            break
+                    off = start + i * self.block
+                    length = min(self.block, end - off)
+                    rl = length - (length % sector)   # хвост: O_DIRECT требует выравнивания по сектору
+                    if rl <= 0:
+                        done_bytes += length
+                        continue
+                    t0 = time.perf_counter()
+                    code = 0
+                    try:
+                        n = os.preadv(fd, [view[:rl]], off)
+                        if n <= 0:
+                            code = 6
+                    except OSError:
+                        code = 6
+                    dt = (time.perf_counter() - t0) * 1000.0
+                    if code != 6:
+                        code = bisect.bisect_right(th, dt)
+                        if code > 5:
+                            code = 5
+                    buckets[code] += 1
+                    done_bytes += length
+                    c = i * cells // nblocks
+                    if cell_code[c] == 255 or code > cell_code[c]:
+                        cell_code[c] = code
+                    dirty_lo = c if dirty_lo is None else min(dirty_lo, c)
+                    dirty_hi = c if dirty_hi is None else max(dirty_hi, c)
+                    if code >= 3 and len(log) < 60:
+                        log.append([off, round(dt, 1), code])
+                    now = time.perf_counter()
+                    if now - t_last >= 0.1:
+                        mbps = (done_bytes - bytes_last) / (now - t_last) / 1e6
+                        self._emit(buckets, done_bytes, mbps, now - t_begin, cell_code, dirty_lo, dirty_hi, log,
+                                   off if not self.reverse else off)
+                        dirty_lo = dirty_hi = None
+                        log = []
+                        t_last, bytes_last = now, done_bytes
+                now = time.perf_counter()
+                self._emit(buckets, done_bytes, 0.0, now - t_begin, cell_code, dirty_lo, dirty_hi, log, None)
+            finally:
+                os.close(fd)
+        except BadRequest as e:
+            send({"id": self.rid, "ev": "err", "msg": str(e)})
+            return
+        except OSError as e:
+            send({"id": self.rid, "ev": "err", "msg": f"ошибка доступа к диску: {e.strerror}"})
+            return
+        send({"id": self.rid, "ev": "done", "reason": reason, "buckets": buckets, "bytes": done_bytes})
+
+    def _emit(self, buckets, done_bytes, mbps, elapsed, cell_code, lo, hi, log, pos):
+        msg = {"id": self.rid, "ev": "progress", "buckets": buckets, "bytes": done_bytes,
+               "mbps": round(mbps, 2), "elapsed": round(elapsed, 2), "pos": pos}
+        if lo is not None:
+            seg = cell_code[lo:hi + 1]
+            msg["map_from"] = lo
+            msg["map"] = "".join("." if b == 255 else str(b) for b in seg)
+        if log:
+            msg["log"] = log
+        send(msg)
+
+
+# --------------------------------------------------------------------------- Доступ на чтение для восстановления
+
+grants = {}   # устройство -> uid, которому выдан ACL на чтение
+
+
+def cmd_grant(req):
+    """Дать пользователю право ЧТЕНИЯ выбранного диска (ACL), чтобы разбор шёл без root. Снимается при выходе."""
+    dev = check_dev(req.get("dev"))
+    own = invoking_owner()
+    if not own:
+        raise BadRequest("не удалось определить пользователя")
+    p = subprocess.run(["setfacl", "-m", f"u:{own[0]}:r", dev], capture_output=True, text=True, timeout=15)
+    if p.returncode != 0:
+        raise BadRequest("setfacl: " + (p.stderr.strip() or "не удалось выдать доступ"))
+    grants[dev] = own[0]
+    return {"dev": dev}
+
+
+def revoke_all():
+    for dev, uid in list(grants.items()):
+        subprocess.run(["setfacl", "-x", f"u:{uid}", dev], capture_output=True, timeout=15)
+        grants.pop(dev, None)
+
+
+def cmd_revoke(req):
+    dev = check_dev(req.get("dev"))
+    uid = grants.pop(dev, None)
+    if uid is not None:
+        subprocess.run(["setfacl", "-x", f"u:{uid}", dev], capture_output=True, timeout=15)
+    return {}
+
+
+# --------------------------------------------------------------------------- Образ диска (ddrescue)
+
+SAFE_DEST_PREFIXES = ("/home/", "/run/media/", "/mnt/", "/media/")
+STATES = "?*/-+"          # ddrescue: не пробовали, не обрезано, не добрано, плохие секторы, спасено
+UNITS = {"B": 1, "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4, "PB": 1000 ** 5,
+         "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+PHASES = (("Copying non-tried", "copy"), ("Trimming", "trim"), ("Sweeping", "scrape"), ("Scraping", "scrape"),
+          ("Retrying", "retry"), ("Finished", "done"))
+
+
+def invoking_owner():
+    """uid/gid пользователя, запустившего pkexec/sudo: ему отдаём файлы образа."""
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    if not uid or not uid.isdigit() or int(uid) == 0:
+        return None
+    try:
+        return int(uid), pwd.getpwuid(int(uid)).pw_gid
+    except KeyError:
+        return None
+
+
+def disk_ancestors(dev):
+    """Устройство и все его «родители» (раздел -> диск) по lsblk."""
+    p = subprocess.run(["lsblk", "-s", "-n", "-l", "-o", "NAME", dev], capture_output=True, text=True, timeout=15)
+    return set(p.stdout.split())
+
+
+def backing_disk_of_path(path):
+    p = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--target", path], capture_output=True, text=True, timeout=15)
+    src = re.sub(r"\[.*\]$", "", p.stdout.strip())
+    return src if src.startswith("/dev/") else None
+
+
+def check_image_paths(src_dev, image, mapfile, need_bytes):
+    """Проверки пути образа. Возвращает (image, mapfile, resume)."""
+    for pth in (image, mapfile):
+        if not isinstance(pth, str) or "\0" in pth or not os.path.isabs(pth):
+            raise BadRequest("путь к образу должен быть абсолютным")
+    image = os.path.normpath(image)
+    mapfile = os.path.normpath(mapfile)
+    if os.path.dirname(image) != os.path.dirname(mapfile):
+        raise BadRequest("карта должна лежать рядом с образом")
+    for pth in (image, mapfile):
+        if not pth.startswith(SAFE_DEST_PREFIXES):
+            raise BadRequest("образ можно сохранять только в /home, /run/media, /mnt или /media")
+        if os.path.islink(pth):
+            raise BadRequest("символические ссылки в пути образа не допускаются")
+    parent = os.path.realpath(os.path.dirname(image))
+    if not (parent + "/").startswith(SAFE_DEST_PREFIXES) or not os.path.isdir(parent):
+        raise BadRequest("папка назначения недоступна")
+    if not mapfile.endswith(".map") or image.endswith(".map"):
+        raise BadRequest("карта должна называться *.map")
+    ex_img, ex_map = os.path.exists(image), os.path.exists(mapfile)
+    if ex_img and not ex_map:
+        raise BadRequest("файл образа уже существует без карты Disk++; выберите другое имя")
+    if ex_map and not ex_img:
+        raise BadRequest("рядом лежит карта без образа; выберите другое имя")
+    for pth in (image, mapfile):
+        if os.path.exists(pth) and not os.path.isfile(pth):
+            raise BadRequest("назначение не является обычным файлом")
+    # образ не должен лежать на том же физическом диске, что и источник
+    dest_dev = backing_disk_of_path(parent)
+    if dest_dev and disk_ancestors(src_dev) & disk_ancestors(dest_dev):
+        raise BadRequest("образ нельзя сохранять на тот же диск, который спасаем")
+    # место
+    if not ex_img:
+        free = shutil.disk_usage(parent).free
+        if free < need_bytes + 64 * 1024 * 1024:
+            raise BadRequest("на диске назначения не хватает места")
+    return image, mapfile, ex_img
+
+
+def parse_size(num, unit):
+    return int(float(num) * UNITS.get(unit, 1))
+
+
+def parse_duration(txt):
+    txt = txt.strip()
+    if not txt or txt == "n/a":
+        return None
+    total = 0
+    for n, u in re.findall(r"(\d+)\s*([dhms])", txt):
+        total += int(n) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[u]
+    return total
+
+
+def read_mapfile(path):
+    """-> (entries[(pos, size, status)], current(pos, status, pass)).
+    Первая строка данных — всегда «текущее состояние» (pos status pass); символ состояния бывает не только ?*/-+
+    (в ddrescue 1.30 есть, например, % для «Sweeping»), поэтому по символу его не определяем."""
+    entries, cur = [], None
+    try:
+        with open(path) as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                t = line.split()
+                if cur is None:
+                    cur = (int(t[0], 0), t[1], int(t[2]) if len(t) > 2 else 1)
+                elif len(t) >= 3:
+                    entries.append((int(t[0], 0), int(t[1], 0), t[2]))
+    except (OSError, ValueError, IndexError):
+        return [], None
+    return entries, cur
+
+
+def map_cells(entries, total, cells):
+    """Свёртка карты ddrescue в строку из `cells` символов: ? * / - + (худшее состояние клетки)."""
+    if total <= 0 or cells <= 0:
+        return ""
+    csz = total / cells
+    flags = [0] * cells
+    fin = [0.0] * cells
+    bit = {"-": 8, "/": 4, "*": 2, "?": 1}
+    for pos, size, st in entries:
+        if size <= 0:
+            continue
+        end = pos + size
+        c0 = min(int(pos / csz), cells - 1)
+        c1 = min(int((end - 1) / csz), cells - 1)
+        for c in range(c0, c1 + 1):
+            if st == "+":
+                lo = max(pos, c * csz)
+                hi = min(end, (c + 1) * csz)
+                fin[c] += max(hi - lo, 0)
+            else:
+                flags[c] |= bit.get(st, 0)
+    out = []
+    for c in range(cells):
+        f = flags[c]
+        if f & 8:
+            out.append("-")
+        elif f & 4:
+            out.append("/")
+        elif f & 2:
+            out.append("*")
+        elif f & 1:
+            out.append("?")
+        else:
+            out.append("+")
+    return "".join(out)
+
+
+def _reset_signals():
+    """Дочерний ddrescue должен реагировать на SIGINT/SIGTERM, даже если помощник запущен из фонового задания."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE):
+        signal.signal(sig, signal.SIG_DFL)
+
+
+class Image(threading.Thread):
+    """ddrescue: снятие образа с (возможно умирающего) диска. Источник читается только на чтение."""
+
+    def __init__(self, rid, req):
+        super().__init__(daemon=True)
+        self.rid = rid
+        self.src = check_dev(req.get("dev"))
+        fd = os.open(self.src, os.O_RDONLY)
+        try:
+            self.size = block_size_of(fd)
+            self.sector = logical_sector(fd)
+        finally:
+            os.close(fd)
+        if self.size <= 0:
+            raise BadRequest("не удалось определить размер диска")
+        self.image, self.mapfile, self.resume = check_image_paths(
+            self.src, req.get("image"), req.get("mapfile"), self.size)
+        self.retries = max(-1, min(int(req.get("retries", 0)), 50))
+        self.reverse = bool(req.get("reverse", False))
+        self.no_scrape = bool(req.get("no_scrape", False))
+        self.cluster = max(8, min(int(req.get("cluster", 128)), 4096))
+        self.max_cells = max(100, min(int(req.get("cells", 6000)), 40000))
+        self.proc = None
+        self.user_stop = False
+        self.paused = False
+        self.live = {"phase": "copy", "rate": 0, "avg": 0, "remaining": None, "errors": 0, "since_good": 0,
+                     "ipos": 0, "bad_areas": 0}
+        self.tail = []
+
+    def cmd(self):
+        c = ["ddrescue", "-d", "-b", str(self.sector), "-c", str(self.cluster), "--mapfile-interval=2,5",
+             "-r", str(self.retries)]
+        if self.reverse:
+            c.append("-R")
+        if self.no_scrape:
+            c.append("-n")
+        return c + [self.src, self.image, self.mapfile]
+
+    # управление
+    def stop(self):
+        self.user_stop = True
+        if self.proc and self.proc.poll() is None:
+            try:
+                if self.paused:
+                    self.proc.send_signal(signal.SIGCONT)
+                self.proc.send_signal(signal.SIGINT)   # ddrescue сохранит карту и выйдет
+            except OSError:
+                pass
+            threading.Timer(20.0, self._kill_if_alive).start()
+
+    def _kill_if_alive(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+    def pause(self):
+        if self.proc and self.proc.poll() is None and not self.paused:
+            self.proc.send_signal(signal.SIGSTOP)
+            self.paused = True
+
+    def resume(self):
+        if self.proc and self.proc.poll() is None and self.paused:
+            self.proc.send_signal(signal.SIGCONT)
+            self.paused = False
+
+    def give_files_to_user(self):
+        own = invoking_owner()
+        if own:
+            for pth in (self.image, self.mapfile, self.mapfile + ".bak"):
+                try:
+                    os.chown(pth, own[0], own[1])
+                except OSError:
+                    pass
+
+    def run(self):
+        env = dict(os.environ, LC_ALL="C", LANG="C", TERM="dumb")
+        try:
+            self.proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                                         stdin=subprocess.DEVNULL, start_new_session=True,
+                                         preexec_fn=_reset_signals)
+        except OSError as e:
+            send({"id": self.rid, "ev": "err", "msg": f"не удалось запустить ddrescue: {e.strerror}"})
+            return
+        send({"id": self.rid, "ev": "start", "total": self.size, "image": self.image, "mapfile": self.mapfile,
+              "resume": self.resume, "cells": self.max_cells, "sector": self.sector})
+        last_emit = 0.0
+        t0 = time.time()
+        buf = b""
+        fd = self.proc.stdout.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            buf += chunk
+            parts = re.split(rb"\x1b\[[0-9;]*[A-Za-z]|\r|\n", buf)
+            buf = parts.pop()      # неполный хвост
+            for raw in parts:
+                self.feed(raw.decode("utf-8", "replace"))
+            now = time.time()
+            if now - last_emit >= 1.0:
+                last_emit = now
+                self.emit(now - t0)
+        rc = self.proc.wait()
+        # файлы отдаём пользователю только ПОСЛЕ работы ddrescue: в общих «липких» папках (/tmp, /var/tmp)
+        # ядро (fs.protected_regular) запрещает root открывать чужие файлы и ddrescue перестаёт сохранять карту
+        self.give_files_to_user()
+        self.emit(time.time() - t0, final=True)
+        if self.user_stop:
+            reason = "stopped"
+        elif rc == 0:
+            reason = "finished"
+        else:
+            reason = "failed"
+        entries, _cur = read_mapfile(self.mapfile)
+        sizes = {s: 0 for s in STATES}
+        for _p, sz, st in entries:
+            sizes[st] = sizes.get(st, 0) + sz
+        send({"id": self.rid, "ev": "done", "reason": reason, "rc": rc, "sizes": sizes,
+              "tail": [t for t in self.tail[-6:]], "image": self.image, "mapfile": self.mapfile})
+
+    # разбор вывода ddrescue
+    def feed(self, line):
+        s = line.strip()
+        if not s:
+            return
+        m = re.search(r"ipos:\s*([\d.]+)\s*(\w+),.*?current rate:\s*([\d.]+)\s*(\w+)/s", s)
+        if m:
+            self.live["ipos"] = parse_size(m.group(1), m.group(2))
+            self.live["rate"] = parse_size(m.group(3), m.group(4))
+            return
+        m = re.search(r"opos:.*?average rate:\s*([\d.]+)\s*(\w+)/s", s)
+        if m:
+            self.live["avg"] = parse_size(m.group(1), m.group(2))
+            return
+        m = re.search(r"bad areas:\s*(\d+)", s)
+        if m:
+            self.live["bad_areas"] = int(m.group(1))
+            return
+        m = re.search(r"read errors:\s*(\d+),\s*remaining time:\s*(.*)$", s)
+        if m:
+            self.live["errors"] = int(m.group(1))
+            self.live["remaining"] = parse_duration(m.group(2))
+            return
+        m = re.search(r"time since last successful read:\s*(.*)$", s)
+        if m:
+            self.live["since_good"] = parse_duration(m.group(1)) or 0
+            return
+        for key, name in PHASES:
+            if s.startswith(key):
+                self.live["phase"] = name
+                m2 = re.search(r"Pass (\d+)", s)
+                self.live["pass"] = int(m2.group(1)) if m2 else 1
+                return
+        if not re.match(r"(non-tried|rescued|pct rescued|Press Ctrl-C|GNU ddrescue|Initial status|Current status)", s):
+            self.tail.append(s[:200])
+            del self.tail[:-30]
+
+    def emit(self, elapsed, final=False):
+        entries, cur = read_mapfile(self.mapfile)
+        sizes = {s: 0 for s in STATES}
+        for _p, sz, st in entries:
+            sizes[st] = sizes.get(st, 0) + sz
+        msg = {"id": self.rid, "ev": "progress", "elapsed": round(elapsed, 1), "sizes": sizes,
+               "map": map_cells(entries, self.size, min(self.max_cells, max(self.size // 65536, 1))),
+               "paused": self.paused, **self.live}
+        if cur:
+            msg["cur_pos"] = cur[0]
+        send(msg)
+
+
+# --------------------------------------------------------------------------- Клонирование диска (ЕДИНСТВЕННОЕ место, где пишем на диски)
+#
+# Защита: все проверки делает помощник, а не интерфейс. Диск назначения не должен быть примонтированным, системным,
+# совпадать с источником; разделы источника не должны быть примонтированы; уменьшать разделы нельзя; для запуска
+# нужно подтверждение именем устройства. Команда `clone_check` ничего не пишет и нужна для предпросмотра и тестов.
+
+WHOLE_DISK_RE = re.compile(r"^/dev/(sd[a-z]+|vd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+|loop\d+)$")
+SYSTEM_MOUNTS = ("/", "/boot", "/efi", "/boot/efi", "/home", "/usr", "/var")
+CLONERS = {"ntfs": "partclone.ntfs", "ext2": "partclone.extfs", "ext3": "partclone.extfs", "ext4": "partclone.extfs",
+           "btrfs": "partclone.btrfs", "xfs": "partclone.xfs", "vfat": "partclone.vfat", "exfat": "partclone.exfat",
+           "f2fs": "partclone.f2fs", "hfsplus": "partclone.hfsp"}
+GROWERS = {"ntfs", "ext2", "ext3", "ext4", "btrfs", "xfs"}
+SECTOR = 512
+ALIGN = 2048
+
+
+def lsblk_node(dev):
+    p = subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS,PARTUUID", dev],
+                       capture_output=True, text=True, timeout=20)
+    try:
+        return json.loads(p.stdout)["blockdevices"][0]
+    except (ValueError, KeyError, IndexError):
+        raise BadRequest("не удалось прочитать устройство через lsblk")
+
+
+def mounts_of(node):
+    out = [m for m in (node.get("mountpoints") or []) if m]
+    for c in node.get("children") or []:
+        out += mounts_of(c)
+    return out
+
+
+def system_disk_names():
+    """Имена дисков, на которых лежит работающая система."""
+    names = set()
+    for mp in SYSTEM_MOUNTS:
+        p = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--target", mp], capture_output=True, text=True, timeout=15)
+        src = re.sub(r"\[.*\]$", "", p.stdout.strip())
+        if src.startswith("/dev/"):
+            names |= disk_ancestors(src)
+    return names
+
+
+def part_node_path(disk, n):
+    return f"{disk}p{n}" if disk[-1].isdigit() else f"{disk}{n}"
+
+
+def sfdisk_dump(dev):
+    p = subprocess.run(["sfdisk", "-J", dev], capture_output=True, text=True, timeout=20)
+    try:
+        return json.loads(p.stdout)["partitiontable"]
+    except (ValueError, KeyError):
+        return None
+
+
+def disk_sectors(dev):
+    return int(subprocess.run(["blockdev", "--getsz", dev], capture_output=True, text=True, timeout=10).stdout.strip() or 0)
+
+
+def check_clone(req):
+    """Проверить план клонирования, ничего не меняя. -> dict(problems, warnings, plan, label, script_preview)"""
+    problems, warnings = [], []
+    src, dst = req.get("src"), req.get("dst")
+    for name, dev in (("источник", src), ("назначение", dst)):
+        if not isinstance(dev, str) or not WHOLE_DISK_RE.match(dev):
+            raise BadRequest(f"{name}: нужен весь диск (sdX, nvmeXnY, mmcblkX, loopN), а не раздел")
+    src, dst = check_dev(src), check_dev(dst)
+    if src == dst or disk_ancestors(src) & disk_ancestors(dst):
+        raise BadRequest("источник и назначение — один и тот же диск")
+    dst_node = lsblk_node(dst)
+    mounted = mounts_of(dst_node)
+    if mounted:
+        problems.append("Диск назначения используется: " + ", ".join(sorted(set(mounted))[:4]) + ". Отмонтируйте разделы.")
+    sysd = system_disk_names()
+    if os.path.basename(dst) in sysd or disk_ancestors(dst) & sysd:
+        problems.append("Диск назначения — системный (на нём работает ОС). Клонировать на него нельзя.")
+    table = sfdisk_dump(src)
+    if not table or table.get("label") not in ("gpt", "dos"):
+        raise BadRequest("на источнике нет таблицы разделов GPT или MBR: такой диск клонируется посекторно (пока не поддерживается)")
+    label = table["label"]
+    src_parts = {p["node"]: p for p in table.get("partitions", [])}
+    src_node = lsblk_node(src)
+    fs_of = {c["path"]: (c.get("fstype") or "") for c in src_node.get("children") or []}
+    mnt_of = {c["path"]: [m for m in (c.get("mountpoints") or []) if m] + [m for g in (c.get("children") or []) for m in mounts_of(g)]
+              for c in src_node.get("children") or []}
+    d_sectors = disk_sectors(dst)
+    usable_end = d_sectors - (34 if label == "gpt" else 0)
+    plan = []
+    req_parts = req.get("parts") or []
+    if not req_parts:
+        raise BadRequest("не выбрано ни одного раздела")
+    last_end = 0
+    for i, rp in enumerate(req_parts):
+        node = rp.get("src")
+        if node not in src_parts:
+            raise BadRequest(f"раздел {node} не принадлежит исходному диску")
+        sp = src_parts[node]
+        start, size = int(rp.get("start", 0)), int(rp.get("size", 0))
+        fs = fs_of.get(node, "")
+        if start % ALIGN or start < ALIGN:
+            problems.append(f"Раздел {i + 1}: начало должно быть кратно 1 МиБ (сектор {start})")
+        if size < sp["size"]:
+            problems.append(f"Раздел {i + 1}: уменьшать раздел нельзя (было {sp['size'] * SECTOR // 2**20} МиБ)")
+        if start < last_end:
+            problems.append(f"Раздел {i + 1}: пересекается с предыдущим")
+        if start + size > usable_end:
+            problems.append(f"Раздел {i + 1}: не помещается на диск назначения")
+        last_end = start + size
+        if mnt_of.get(node):
+            if fs == "swap":
+                warnings.append(f"Раздел подкачки {node} активен: он будет создан заново, данные не копируются")
+            else:
+                problems.append(f"Раздел {node} примонтирован ({', '.join(mnt_of[node])}). Отмонтируйте его: копия работающей системы получится повреждённой.")
+        method = "swap" if fs == "swap" else CLONERS.get(fs, "raw")
+        if method == "raw" and fs:
+            warnings.append(f"Раздел {node}: файловая система «{fs}» копируется посекторно (медленнее, всё содержимое)")
+        grow = size > sp["size"]
+        if grow and fs not in GROWERS and fs != "swap":
+            warnings.append(f"Раздел {node}: файловая система «{fs or 'неизвестно'}» не расширяется, лишнее место останется неразмеченным внутри раздела")
+        plan.append({"src": node, "start": start, "size": size, "fs": fs, "method": method, "grow": grow and fs in GROWERS,
+                     "type": sp.get("type"), "uuid": sp.get("uuid"), "name": sp.get("name", ""), "bootable": bool(sp.get("bootable")),
+                     "src_size": sp["size"]})
+    if not req.get("new_ids") and any(p["fs"] in ("btrfs", "ext2", "ext3", "ext4", "xfs") for p in plan):
+        warnings.append("У клона будут те же идентификаторы (UUID), что у оригинала. Не подключайте оригинал и клон одновременно или включите «Новые идентификаторы».")
+    return {"problems": problems, "warnings": warnings, "plan": plan, "label": label, "src": src, "dst": dst,
+            "label_id": table.get("id"), "dst_sectors": d_sectors}
+
+
+def sfdisk_script(chk, new_ids):
+    lines = [f"label: {chk['label']}"]
+    if chk.get("label_id") and not new_ids:
+        lines.append(f"label-id: {chk['label_id']}")
+    lines.append("")
+    for p in chk["plan"]:
+        f = [f"start={p['start']}", f"size={p['size']}", f"type={p['type']}"]
+        if chk["label"] == "gpt":
+            if p.get("uuid") and not new_ids:
+                f.append(f"uuid={p['uuid']}")
+            if p.get("name"):
+                f.append('name="%s"' % p["name"].replace('"', "'"))
+        elif p.get("bootable"):
+            f.append("bootable")
+        lines.append(", ".join(f))
+    return "\n".join(lines) + "\n"
+
+
+def clone_steps(chk, verify):
+    steps = ["Подготовка диска назначения", "Создание таблицы разделов"]
+    for i, p in enumerate(chk["plan"], 1):
+        steps.append(f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else ""))
+        if p["grow"]:
+            steps.append(f"Раздел {i}: расширение файловой системы")
+    if verify:
+        steps.append("Проверка целостности")
+    steps.append("Завершение")
+    return steps
+
+
+class Clone(threading.Thread):
+    def __init__(self, rid, req, chk=None):
+        super().__init__(daemon=True)
+        self.rid = rid
+        chk = chk or check_clone(req)
+        if chk["problems"]:
+            raise BadRequest("; ".join(chk["problems"]))
+        if req.get("confirm") != os.path.basename(chk["dst"]):
+            raise BadRequest("не подтверждено: введите имя диска назначения")
+        self.chk = chk
+        self.new_ids = bool(req.get("new_ids"))
+        self.verify = bool(req.get("verify", True))
+        self.dry = bool(req.get("dry_run"))
+        self.proc = None
+        self.stop_flag = threading.Event()
+        self.warnings = list(chk["warnings"])
+        self.tmp = tempfile.mkdtemp(prefix="dpclone-")
+        self.step = -1
+        self.steps = clone_steps(chk, self.verify)
+        self.procs = []
+
+    def stop(self):
+        self.stop_flag.set()
+        for pr in ([self.proc] if self.proc else []) + self.procs:
+            if pr and pr.poll() is None:
+                try:
+                    pr.send_signal(signal.SIGTERM)
+                except OSError:
+                    pass
+
+    pause = resume = lambda self: None
+
+    def pre(self):
+        """Хук перед первым шагом (в восстановлении здесь проверяется резервная копия)."""
+
+    def run_pipe(self, cmd1, cmd2, poll=None, sink=None, cmd2_env=None):
+        """cmd1 | cmd2. Если sink задан, вывод cmd2 читается Python-ом и передаётся в sink(chunk) (запись и хеш за один проход)."""
+        if self.stop_flag.is_set():
+            raise RuntimeError("остановлено")
+        if self.dry:
+            send({"id": self.rid, "ev": "log", "text": "DRY: " + " ".join(cmd1) + " | " + " ".join(cmd2)})
+            return
+        e = dict(os.environ, LC_ALL="C", LANG="C")
+        l1 = open(os.path.join(self.tmp, "p1.err"), "w+")
+        l2 = open(os.path.join(self.tmp, "p2.err"), "w+")
+        p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=l1, env=e, preexec_fn=_reset_signals,
+                              stdin=subprocess.DEVNULL)
+        p2 = subprocess.Popen(cmd2, stdin=p1.stdout, stdout=subprocess.PIPE if sink else subprocess.DEVNULL, stderr=l2,
+                              env=e, preexec_fn=_reset_signals)
+        p1.stdout.close()
+        self.procs = [p1, p2]
+        t = None
+        if sink:
+            def pump():
+                while True:
+                    chunk = p2.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    sink(chunk)
+            t = threading.Thread(target=pump, daemon=True)
+            t.start()
+        while p1.poll() is None or p2.poll() is None:
+            time.sleep(0.4)
+            if poll:
+                poll()
+        if t:
+            t.join(timeout=30)
+        self.procs = []
+        if self.stop_flag.is_set():
+            raise RuntimeError("остановлено")
+        for name, pr, lg in ((os.path.basename(cmd1[0]), p1, l1), (os.path.basename(cmd2[0]), p2, l2)):
+            if pr.returncode != 0:
+                lg.seek(0)
+                tail = [x for x in lg.read().replace("\r", "\n").splitlines() if x.strip()][-3:]
+                raise RuntimeError(f"{name}: код {pr.returncode}: " + " | ".join(tail))
+
+    # --- служебное
+    def begin(self, title):
+        self.step = self.steps.index(title)
+        send({"id": self.rid, "ev": "step", "id_": self.step, "state": "running"})
+
+    def end(self, state="done", note=""):
+        send({"id": self.rid, "ev": "step", "id_": self.step, "state": state, "note": note})
+
+    def sh(self, cmd, stdin=None, env=None, poll=None, ok=(0,)):
+        """Выполнить команду (с возможностью остановки). poll(proc) вызывается ~2 раза в секунду."""
+        if self.stop_flag.is_set():
+            raise RuntimeError("остановлено")
+        if self.dry:
+            send({"id": self.rid, "ev": "log", "text": "DRY: " + " ".join(cmd)})
+            return ""
+        e = dict(os.environ, LC_ALL="C", LANG="C")
+        e.update(env or {})
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e,
+                                     preexec_fn=_reset_signals)
+        out = []
+
+        def reader():
+            for line in self.proc.stdout:
+                out.append(line)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        if stdin is not None:
+            try:
+                self.proc.stdin.write(stdin)
+                self.proc.stdin.close()
+            except OSError:
+                pass
+        while self.proc.poll() is None:
+            time.sleep(0.4)
+            if poll:
+                poll()
+        t.join(timeout=5)
+        rc = self.proc.returncode
+        text = "".join(out)
+        if self.stop_flag.is_set():
+            raise RuntimeError("остановлено")
+        if rc not in ok:
+            tail = [l for l in text.splitlines() if l.strip()][-3:]
+            raise RuntimeError(f"{os.path.basename(cmd[0])}: код {rc}: " + " | ".join(tail))
+        return text
+
+    def wait_nodes(self, nodes):
+        for _ in range(60):
+            if all(os.path.exists(n) for n in nodes):
+                return
+            time.sleep(0.5)
+        raise RuntimeError("разделы на диске назначения не появились")
+
+    # --- основной ход
+    def run(self):
+        chk = self.chk
+        dst = chk["dst"]
+        send({"id": self.rid, "ev": "start", "steps": self.steps, "dry": self.dry, "warnings": self.warnings})
+        reason, err = "finished", ""
+        try:
+            self.pre()
+            self.begin("Подготовка диска назначения")
+            self.sh(["wipefs", "-a", dst])
+            self.end()
+            self.begin("Создание таблицы разделов")
+            script = sfdisk_script(chk, self.new_ids)
+            self.sh(["sfdisk", "--wipe", "always", "--wipe-partitions", "always", "-q", dst], stdin=script)
+            self.sh(["partprobe", dst], ok=(0, 1))
+            self.sh(["udevadm", "settle"], ok=(0, 1))
+            nodes = [part_node_path(dst, i) for i in range(1, len(chk["plan"]) + 1)]
+            if not self.dry:
+                self.wait_nodes(nodes)
+            for n in nodes:
+                self.sh(["wipefs", "-a", n])
+            self.end()
+            for i, (p, node) in enumerate(zip(chk["plan"], nodes), 1):
+                self.copy_part(i, p, node)
+            if self.verify:
+                self.verify_all(nodes)
+            self.begin("Завершение")
+            self.sh(["sync"])
+            self.sh(["partprobe", dst], ok=(0, 1))
+            self.sh(["udevadm", "settle"], ok=(0, 1))
+            self.end()
+        except RuntimeError as e:
+            err = str(e)
+            reason = "stopped" if err == "остановлено" else "failed"
+            if self.step >= 0:
+                self.end("error", err)
+        except Exception as e:  # noqa: BLE001
+            reason, err = "failed", f"внутренняя ошибка: {e}"
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        send({"id": self.rid, "ev": "done", "reason": reason, "error": err, "warnings": self.warnings})
+
+    def copy_part(self, i, p, node):
+        title = f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else "")
+        self.begin(title)
+        src = p["src"]
+        m = p["method"]
+        if m == "swap":
+            cmd = ["mkswap"]
+            lab = lsblk_node(src).get("label")
+            uu = lsblk_node(src).get("uuid")
+            if lab:
+                cmd += ["-L", lab]
+            if uu and not self.new_ids:
+                cmd += ["-U", uu]
+            self.sh(cmd + [node])
+        elif m == "raw":
+            self.run_partclone("partclone.dd", src, node, i)
+        else:
+            self.run_partclone(CLONERS[p["fs"]], src, node, i)
+        self.end()
+        if p["grow"]:
+            self.begin(f"Раздел {i}: расширение файловой системы")
+            self.grow(p["fs"], node)
+            self.end()
+        if self.new_ids:
+            self.new_uuid(p["fs"], node)
+
+    def run_partclone(self, tool, src, dst, i):
+        status = os.path.join(self.tmp, f"pc{i}.json")
+        log = os.path.join(self.tmp, f"pc{i}.log")
+        rx = re.compile(r'"total_percent":\s*(\d+(?:[.,]\d+)?).*?"rate_bytes_per_sec":\s*(\d+).*?"remaining_sec":\s*(\d+)', re.S)
+
+        def poll():
+            try:
+                txt = open(status).read()
+            except OSError:
+                return
+            m = rx.search(txt)
+            if m:
+                try:
+                    send({"id": self.rid, "ev": "progress", "step": self.step,
+                          "percent": float(m.group(1).replace(",", ".")), "rate": int(m.group(2)), "eta": int(m.group(3))})
+                except ValueError:
+                    pass
+
+        cmd = [tool, "-b", "-s", src, "-O", dst, "-L", log, f"--json-status={status}", "-f", "1"]
+        try:
+            self.sh(cmd, poll=poll)
+        except RuntimeError as e:
+            if "остановлено" in str(e):
+                raise
+            extra = ""
+            try:
+                extra = " | " + [l for l in open(log).read().splitlines() if l.strip()][-1]
+            except (OSError, IndexError):
+                pass
+            raise RuntimeError(str(e) + extra)
+
+    def grow(self, fs, node):
+        if fs == "ntfs":
+            self.sh(["ntfsresize", "-f", "-P", node])
+        elif fs.startswith("ext"):
+            self.sh(["e2fsck", "-f", "-p", node], ok=(0, 1, 2))
+            self.sh(["resize2fs", node])
+        elif fs in ("btrfs", "xfs"):
+            mnt = tempfile.mkdtemp(prefix="dpmnt-", dir=self.tmp)
+            self.sh(["mount", "-o", "nouuid"] + (["-t", "xfs"] if fs == "xfs" else []) + [node, mnt])
+            try:
+                self.sh(["btrfs", "filesystem", "resize", "max", mnt] if fs == "btrfs" else ["xfs_growfs", mnt])
+            finally:
+                subprocess.run(["umount", mnt], capture_output=True)
+
+    def new_uuid(self, fs, node):
+        try:
+            if fs.startswith("ext"):
+                self.sh(["e2fsck", "-f", "-p", node], ok=(0, 1, 2))
+                self.sh(["tune2fs", "-U", "random", node])
+            elif fs == "btrfs":
+                self.sh(["btrfstune", "-u", node])
+            elif fs == "xfs":
+                self.sh(["xfs_admin", "-U", "generate", node])
+        except RuntimeError as e:
+            if "остановлено" in str(e):
+                raise
+            self.warnings.append(f"Не удалось сменить UUID файловой системы {node}: {e}")
+
+    def verify_all(self, nodes):
+        self.begin("Проверка целостности")
+        checks = {"ntfs": ["ntfsfix", "-n"], "ext2": ["e2fsck", "-fn"], "ext3": ["e2fsck", "-fn"], "ext4": ["e2fsck", "-fn"],
+                  "btrfs": ["btrfs", "check", "--readonly"], "xfs": ["xfs_repair", "-n"], "vfat": ["fsck.vfat", "-n"],
+                  "exfat": ["fsck.exfat", "-n"]}
+        bad = 0
+        for i, (p, node) in enumerate(zip(self.chk["plan"], nodes), 1):
+            cmd = checks.get(p["fs"])
+            if not cmd:
+                continue
+            try:
+                self.sh(cmd + [node])
+            except RuntimeError as e:
+                if "остановлено" in str(e):
+                    raise
+                bad += 1
+                self.warnings.append(f"Раздел {i}: проверка файловой системы сообщила о проблемах ({e})")
+        self.end("warn" if bad else "done", "есть замечания" if bad else "")
+
+
+# --------------------------------------------------------------------------- Резервные копии (образы разделов partclone + zstd)
+#
+# Папка копии: manifest.json (таблица разделов, UUID, размеры, sha256 файлов), table.sfdisk и part<N>-<fs>.pcl.zst.
+# Копия читает разделы только на чтение. Восстановление использует те же проверки безопасности, что и клонирование.
+
+BACKUP_FORMAT = "diskplus-backup/1"
+
+
+def check_backup_dest(src, folder, need=256 * 2**20):
+    for pth in (folder,):
+        if not isinstance(pth, str) or "\0" in pth or not os.path.isabs(pth):
+            raise BadRequest("путь к копии должен быть абсолютным")
+    folder = os.path.normpath(folder)
+    if not (folder + "/").startswith(SAFE_DEST_PREFIXES):
+        raise BadRequest("копию можно сохранять только в /home, /run/media, /mnt или /media")
+    if os.path.lexists(folder):
+        raise BadRequest("папка для копии уже существует; выберите новое имя")
+    parent = os.path.realpath(os.path.dirname(folder))
+    if not (parent + "/").startswith(SAFE_DEST_PREFIXES) or not os.path.isdir(parent):
+        raise BadRequest("папка назначения недоступна")
+    if os.path.islink(os.path.dirname(folder)):
+        raise BadRequest("символические ссылки в пути не допускаются")
+    dest_dev = backing_disk_of_path(parent)
+    if dest_dev and disk_ancestors(src) & disk_ancestors(dest_dev):
+        raise BadRequest("копию нельзя сохранять на тот же диск, с которого она делается")
+    if shutil.disk_usage(parent).free < need:
+        raise BadRequest("на диске назначения не хватает места")
+    return os.path.join(parent, os.path.basename(folder))
+
+
+def sha256_file(path, cb=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(4 << 20)
+            if not b:
+                break
+            h.update(b)
+            if cb:
+                cb(len(b))
+    return h.hexdigest()
+
+
+def backup_member(folder, name):
+    """Файл внутри папки копии: имя без путей."""
+    if not isinstance(name, str) or "/" in name or name in ("", ".", ".."):
+        raise BadRequest("некорректное имя файла в манифесте")
+    return os.path.join(folder, name)
+
+
+def load_manifest(folder):
+    if not isinstance(folder, str) or not os.path.isabs(folder) or "\0" in folder:
+        raise BadRequest("путь к копии должен быть абсолютным")
+    folder = os.path.realpath(folder)
+    mp = os.path.join(folder, "manifest.json")
+    try:
+        m = json.load(open(mp))
+    except (OSError, ValueError):
+        raise BadRequest("в этой папке нет резервной копии Disk++ (manifest.json)")
+    if m.get("format") != BACKUP_FORMAT or not isinstance(m.get("partitions"), list):
+        raise BadRequest("неизвестный формат копии")
+    return folder, m
+
+
+def verify_files(folder, manifest, progress=None, stop=None):
+    """Проверка копии: sha256 каждого файла + целостность zstd + (где есть) целостность образа partclone.
+    Возвращает список проблем (пустой = всё хорошо)."""
+    problems = []
+    total = sum(p.get("bytes", 0) for p in manifest["partitions"]) or 1
+    done = [0]
+
+    def cb(n):
+        done[0] += n
+        if progress:
+            progress(min(done[0] / total * 100, 99.0))
+
+    for p in manifest["partitions"]:
+        if not p.get("file"):
+            continue
+        path = backup_member(folder, p["file"])
+        if stop and stop.is_set():
+            raise RuntimeError("остановлено")
+        if not os.path.exists(path):
+            problems.append(f"{p['file']}: файл отсутствует")
+            continue
+        if sha256_file(path, cb) != p.get("sha256"):
+            problems.append(f"{p['file']}: контрольная сумма не совпадает (файл повреждён)")
+            continue
+        z = subprocess.run(["zstd", "-t", "-q", path], capture_output=True, text=True)
+        if z.returncode != 0:
+            problems.append(f"{p['file']}: ошибка сжатия ({z.stderr.strip()[:80]})")
+    return problems
+
+
+class Backup(Clone):
+    """Создание резервной копии выбранных разделов диска."""
+
+    def __init__(self, rid, req):
+        threading.Thread.__init__(self, daemon=True)
+        self.rid = rid
+        src = req.get("src")
+        if not isinstance(src, str) or not WHOLE_DISK_RE.match(src):
+            raise BadRequest("источник: нужен весь диск, а не раздел")
+        self.src = check_dev(src)
+        table = sfdisk_dump(self.src)
+        if not table or table.get("label") not in ("gpt", "dos"):
+            raise BadRequest("на диске нет таблицы разделов GPT или MBR")
+        self.table = table
+        self.folder = check_backup_dest(self.src, req.get("dest"))
+        self.level = max(1, min(int(req.get("level", 3)), 19))
+        self.verify = bool(req.get("verify", True))
+        node = lsblk_node(self.src)
+        by_path = {c["path"]: c for c in node.get("children") or []}
+        sparts = {p["node"]: (i, p) for i, p in enumerate(table.get("partitions", []), 1)}
+        chosen = req.get("parts") or []
+        if not chosen:
+            raise BadRequest("не выбрано ни одного раздела")
+        self.items = []
+        for pth in chosen:
+            if pth not in sparts or pth not in by_path:
+                raise BadRequest(f"раздел {pth} не принадлежит диску")
+            i, sp = sparts[pth]
+            c = by_path[pth]
+            mounts = mounts_of(c)
+            fs = c.get("fstype") or ""
+            if mounts and fs != "swap":
+                raise BadRequest(f"Раздел {pth} примонтирован ({', '.join(mounts)}). Отмонтируйте его: копия работающей системы получится повреждённой.")
+            method = "swap" if fs == "swap" else CLONERS.get(fs, "raw")
+            self.items.append({"index": i, "node": pth, "fs": fs, "method": method, "sp": sp, "c": c})
+        self.items.sort(key=lambda t: t["index"])
+        self.model = node.get("model") or ""
+        self.stop_flag = threading.Event()
+        self.proc = None
+        self.procs = []
+        self.warnings = []
+        self.dry = False
+        self.tmp = tempfile.mkdtemp(prefix="dpbackup-")
+        self.step = -1
+        self.steps = [f"Раздел {t['index']}: сжатие" + (f" ({t['fs']})" if t["fs"] else "") for t in self.items]
+        if self.verify:
+            self.steps.append("Проверка копии")
+        self.steps.append("Завершение")
+
+    def run(self):
+        send({"id": self.rid, "ev": "start", "steps": self.steps, "dry": False, "warnings": []})
+        reason, err = "finished", ""
+        made = False
+        try:
+            os.makedirs(self.folder, mode=0o755)
+            made = True
+            parts = []
+            for t in self.items:
+                parts.append(self.backup_one(t))
+            self.begin("Завершение") if not self.verify else None
+            if self.verify:
+                self.begin("Проверка копии")
+            manifest = self.manifest(parts)
+            open(os.path.join(self.folder, "table.sfdisk"), "w").write(
+                subprocess.run(["sfdisk", "-d", self.src], capture_output=True, text=True).stdout)
+            json.dump(manifest, open(os.path.join(self.folder, "manifest.json"), "w"), ensure_ascii=False, indent=1)
+            if self.verify:
+                pr = lambda pct: send({"id": self.rid, "ev": "progress", "step": self.step, "percent": pct, "rate": 0, "eta": 0})  # noqa: E731
+                problems = verify_files(self.folder, manifest, pr, self.stop_flag)
+                if problems:
+                    raise RuntimeError("проверка копии не пройдена: " + "; ".join(problems))
+                self.end()
+                self.begin("Завершение")
+            self.give_to_user()
+            self.end()
+        except RuntimeError as e:
+            err = str(e)
+            reason = "stopped" if err == "остановлено" else "failed"
+            if self.step >= 0:
+                self.end("error", err)
+        except OSError as e:
+            reason, err = "failed", f"ошибка записи: {e.strerror}"
+        except Exception as e:  # noqa: BLE001
+            reason, err = "failed", f"внутренняя ошибка: {e}"
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            if reason != "finished" and made:
+                # неполную копию не оставляем: её нельзя отличить от настоящей
+                shutil.rmtree(self.folder, ignore_errors=True)
+        send({"id": self.rid, "ev": "done", "reason": reason, "error": err, "warnings": self.warnings,
+              "folder": self.folder if reason == "finished" else ""})
+
+    def backup_one(self, t):
+        i, fs, node = t["index"], t["fs"], t["node"]
+        title = f"Раздел {i}: сжатие" + (f" ({fs})" if fs else "")
+        self.begin(title)
+        rec = {"index": i, "node": node, "start": t["sp"]["start"], "size": t["sp"]["size"], "type": t["sp"].get("type"),
+               "uuid": t["sp"].get("uuid"), "name": t["sp"].get("name", ""), "bootable": bool(t["sp"].get("bootable")),
+               "fs": fs, "fs_uuid": t["c"].get("uuid") or "", "fs_label": t["c"].get("label") or "", "method": t["method"],
+               "file": "", "bytes": 0, "sha256": ""}
+        if t["method"] != "swap":
+            tool = "partclone.dd" if t["method"] == "raw" else CLONERS[fs]
+            fname = f"part{i}-{fs or 'raw'}.pcl.zst"
+            path = os.path.join(self.folder, fname)
+            status = os.path.join(self.tmp, f"b{i}.json")
+            log = os.path.join(self.tmp, f"b{i}.log")
+            rx = re.compile(r'"total_percent":\s*(\d+(?:[.,]\d+)?).*?"rate_bytes_per_sec":\s*(\d+).*?"remaining_sec":\s*(\d+)', re.S)
+
+            def poll():
+                try:
+                    m = rx.search(open(status).read())
+                    if m:
+                        send({"id": self.rid, "ev": "progress", "step": self.step, "percent": float(m.group(1).replace(",", ".")),
+                              "rate": int(m.group(2)), "eta": int(m.group(3))})
+                except (OSError, ValueError):
+                    pass
+
+            h = hashlib.sha256()
+            total = [0]
+            with open(path, "wb") as out:
+                def sink(chunk):
+                    out.write(chunk)
+                    h.update(chunk)
+                    total[0] += len(chunk)
+
+                self.run_pipe([tool, "-c", "-s", node, "-o", "-", "-L", log, f"--json-status={status}", "-f", "1"],
+                              ["zstd", "-T0", f"-{self.level}", "-q", "-c"], poll=poll, sink=sink)
+            rec.update(file=fname, bytes=total[0], sha256=h.hexdigest())
+        self.end()
+        return rec
+
+    def manifest(self, parts):
+        node = lsblk_node(self.src)
+        return {"format": BACKUP_FORMAT, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "tool": "Disk++",
+                "source": {"path": self.src, "model": self.model, "serial": "", "size_bytes": int(node.get("size") or 0),
+                           "label": self.table["label"], "label_id": self.table.get("id"), "sectors": self.table.get("sectors")},
+                "compression": f"zstd-{self.level}", "partitions": parts}
+
+    def give_to_user(self):
+        own = invoking_owner()
+        if not own:
+            return
+        for dp, dns, fns in os.walk(self.folder):
+            for n in dns + fns:
+                try:
+                    os.chown(os.path.join(dp, n), own[0], own[1])
+                except OSError:
+                    pass
+        try:
+            os.chown(self.folder, own[0], own[1])
+        except OSError:
+            pass
+
+
+def check_restore(req):
+    """Проверка плана восстановления из копии (ничего не пишет)."""
+    folder, man = load_manifest(req.get("folder"))
+    problems, warnings = [], []
+    dst = req.get("dst")
+    if not isinstance(dst, str) or not WHOLE_DISK_RE.match(dst):
+        raise BadRequest("назначение: нужен весь диск (sdX, nvmeXnY, mmcblkX, loopN), а не раздел")
+    dst = check_dev(dst)
+    dst_node = lsblk_node(dst)
+    mounted = mounts_of(dst_node)
+    if mounted:
+        problems.append("Диск назначения используется: " + ", ".join(sorted(set(mounted))[:4]) + ". Отмонтируйте разделы.")
+    sysd = system_disk_names()
+    if os.path.basename(dst) in sysd or disk_ancestors(dst) & sysd:
+        problems.append("Диск назначения — системный (на нём работает ОС). Восстанавливать на него нельзя.")
+    label = man["source"].get("label")
+    if label not in ("gpt", "dos"):
+        raise BadRequest("в копии нет таблицы разделов GPT или MBR")
+    by_index = {p["index"]: p for p in man["partitions"]}
+    d_sectors = disk_sectors(dst)
+    usable_end = d_sectors - (34 if label == "gpt" else 0)
+    plan, last_end = [], 0
+    req_parts = req.get("parts") or []
+    if not req_parts:
+        raise BadRequest("не выбрано ни одного раздела")
+    for n, rp in enumerate(req_parts, 1):
+        p = by_index.get(rp.get("index"))
+        if not p:
+            raise BadRequest("в копии нет такого раздела")
+        start, size = int(rp.get("start", 0)), int(rp.get("size", 0))
+        if start % ALIGN or start < ALIGN:
+            problems.append(f"Раздел {n}: начало должно быть кратно 1 МиБ (сектор {start})")
+        if size < p["size"]:
+            problems.append(f"Раздел {n}: уменьшать раздел нельзя (в копии {p['size'] * SECTOR // 2**20} МиБ)")
+        if start < last_end:
+            problems.append(f"Раздел {n}: пересекается с предыдущим")
+        if start + size > usable_end:
+            problems.append(f"Раздел {n}: не помещается на диск назначения")
+        last_end = start + size
+        fs = p.get("fs", "")
+        if p.get("method") == "raw" and fs:
+            warnings.append(f"Раздел {p['index']}: файловая система «{fs}» восстанавливается посекторно")
+        grow = size > p["size"]
+        if grow and fs not in GROWERS and fs != "swap":
+            warnings.append(f"Раздел {p['index']}: файловая система «{fs or 'неизвестно'}» не расширяется")
+        if p.get("file"):
+            fpath = backup_member(folder, p["file"])
+            if not os.path.exists(fpath):
+                problems.append(f"Раздел {p['index']}: файл копии отсутствует")
+        plan.append({"src": None, "file": p.get("file"), "start": start, "size": size, "fs": fs, "method": p.get("method", "raw"),
+                     "grow": grow and fs in GROWERS, "type": p.get("type"), "uuid": p.get("uuid"), "name": p.get("name", ""),
+                     "bootable": bool(p.get("bootable")), "src_size": p["size"], "fs_uuid": p.get("fs_uuid", ""),
+                     "fs_label": p.get("fs_label", ""), "index": p["index"]})
+    return {"problems": problems, "warnings": warnings, "plan": plan, "label": label, "src": folder, "dst": dst,
+            "label_id": man["source"].get("label_id"), "dst_sectors": d_sectors, "manifest": man}
+
+
+class Restore(Clone):
+    """Восстановление разделов из копии на диск назначения (после тех же проверок, что и клонирование)."""
+
+    def __init__(self, rid, req):
+        chk = check_restore(req)
+        Clone.__init__(self, rid, req, chk)
+        self.folder = chk["src"]
+        self.manifest = chk["manifest"]
+        self.steps = ["Проверка резервной копии"] + self.steps
+
+    def pre(self):
+        self.begin("Проверка резервной копии")
+        pr = lambda pct: send({"id": self.rid, "ev": "progress", "step": self.step, "percent": pct, "rate": 0, "eta": 0})  # noqa: E731
+        problems = verify_files(self.folder, self.manifest, pr, self.stop_flag)
+        if problems:
+            raise RuntimeError("копия повреждена: " + "; ".join(problems))
+        self.end()
+
+    def copy_part(self, i, p, node):
+        title = f"Раздел {i}: копирование" + (f" ({p['fs']})" if p["fs"] else "")
+        self.begin(title)
+        m = p["method"]
+        if m == "swap":
+            cmd = ["mkswap"]
+            if p.get("fs_label"):
+                cmd += ["-L", p["fs_label"]]
+            if p.get("fs_uuid") and not self.new_ids:
+                cmd += ["-U", p["fs_uuid"]]
+            self.sh(cmd + [node])
+        else:
+            tool = "partclone.dd" if m == "raw" else CLONERS[p["fs"]]
+            status = os.path.join(self.tmp, f"r{i}.json")
+            log = os.path.join(self.tmp, f"r{i}.log")
+            rx = re.compile(r'"total_percent":\s*(\d+(?:[.,]\d+)?).*?"rate_bytes_per_sec":\s*(\d+).*?"remaining_sec":\s*(\d+)', re.S)
+
+            def poll():
+                try:
+                    mm = rx.search(open(status).read())
+                    if mm:
+                        send({"id": self.rid, "ev": "progress", "step": self.step, "percent": float(mm.group(1).replace(",", ".")),
+                              "rate": int(mm.group(2)), "eta": int(mm.group(3))})
+                except (OSError, ValueError):
+                    pass
+
+            self.run_pipe(["zstd", "-dc", "-q", backup_member(self.folder, p["file"])],
+                          [tool, "-r", "-s", "-", "-O", node, "-L", log, f"--json-status={status}", "-f", "1"], poll=poll)
+        self.end()
+        if p["grow"]:
+            self.begin(f"Раздел {i}: расширение файловой системы")
+            self.grow(p["fs"], node)
+            self.end()
+        if self.new_ids:
+            self.new_uuid(p["fs"], node)
+
+
+# --------------------------------------------------------------------------- Диспетчер
+
+scans = {}   # активные задания (скан или образ)
+
+
+def handle(req):
+    rid = req.get("id")
+    cmd = req.get("cmd")
+    try:
+        if cmd == "hello":
+            send({"id": rid, "ev": "res", "data": {"version": VERSION, "euid": os.geteuid()}})
+        elif cmd == "smart":
+            send({"id": rid, "ev": "res", "data": cmd_smart(req)})
+        elif cmd == "grant_read":
+            send({"id": rid, "ev": "res", "data": cmd_grant(req)})
+        elif cmd == "revoke_read":
+            send({"id": rid, "ev": "res", "data": cmd_revoke(req)})
+        elif cmd == "selftest":
+            send({"id": rid, "ev": "res", "data": cmd_selftest(req)})
+        elif cmd == "scan":
+            if any(s.is_alive() for s in scans.values()):
+                raise BadRequest("сканирование уже идёт")
+            s = Scan(rid, req)
+            scans[rid] = s
+            s.start()
+        elif cmd == "clone_check":
+            chk = check_clone(req)
+            chk["steps"] = clone_steps(chk, bool(req.get("verify", True)))
+            chk["script"] = sfdisk_script(chk, bool(req.get("new_ids")))
+            send({"id": rid, "ev": "res", "data": chk})
+        elif cmd == "backup":
+            if any(s.is_alive() for s in scans.values()):
+                raise BadRequest("другая операция уже выполняется")
+            j = Backup(rid, req)
+            scans[rid] = j
+            j.start()
+        elif cmd == "backup_verify":
+            folder, man = load_manifest(req.get("folder"))
+            probs = verify_files(folder, man)
+            send({"id": rid, "ev": "res", "data": {"problems": probs, "partitions": len(man["partitions"])}})
+        elif cmd == "restore_check":
+            chk = check_restore(req)
+            chk["steps"] = ["Проверка резервной копии"] + clone_steps(chk, bool(req.get("verify", True)))
+            chk["script"] = sfdisk_script(chk, bool(req.get("new_ids")))
+            chk.pop("manifest", None)
+            send({"id": rid, "ev": "res", "data": chk})
+        elif cmd == "restore":
+            if any(s.is_alive() for s in scans.values()):
+                raise BadRequest("другая операция уже выполняется")
+            j = Restore(rid, req)
+            scans[rid] = j
+            j.start()
+        elif cmd == "clone":
+            if any(s.is_alive() for s in scans.values()):
+                raise BadRequest("другая операция уже выполняется")
+            j = Clone(rid, req)
+            scans[rid] = j
+            j.start()
+        elif cmd == "image":
+            if any(s.is_alive() for s in scans.values()):
+                raise BadRequest("другая операция уже выполняется")
+            j = Image(rid, req)
+            scans[rid] = j
+            j.start()
+        elif cmd in ("pause", "resume", "stop"):
+            s = scans.get(req.get("target"))
+            if s is None:
+                raise BadRequest("нет такого сканирования")
+            getattr(s, cmd)()
+            send({"id": rid, "ev": "res", "data": {}})
+        else:
+            raise BadRequest("неизвестная команда")
+    except BadRequest as e:
+        send({"id": rid, "ev": "err", "msg": str(e)})
+    except Exception as e:  # noqa: BLE001
+        send({"id": rid, "ev": "err", "msg": f"внутренняя ошибка: {e}"})
+
+
+def main():
+    if os.geteuid() != 0:
+        send({"id": 0, "ev": "err", "msg": "помощник должен работать от root"})
+        return 2
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise ValueError
+        except ValueError:
+            send({"id": 0, "ev": "err", "msg": "некорректный запрос"})
+            continue
+        handle(req)
+    for s in scans.values():
+        s.stop()
+    for s in scans.values():     # дать ddrescue сохранить карту
+        s.join(timeout=20)
+    revoke_all()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

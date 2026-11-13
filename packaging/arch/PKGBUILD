@@ -1,0 +1,31 @@
+# Maintainer: Disk++ authors
+pkgname=disk-plus
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Disk++: диагностика дисков, образ умирающего диска, восстановление файлов, клонирование и резервные копии'
+arch=('any')
+url='https://github.com/edgarsskills-fix/disk-plus'
+license=('MIT')
+depends=('python' 'python-gobject' 'python-cairo' 'python-numpy' 'gtk4' 'libadwaita' 'polkit'
+         'smartmontools' 'util-linux' 'gptfdisk' 'parted' 'ddrescue' 'testdisk' 'sleuthkit'
+         'ntfs-3g' 'partclone' 'zstd' 'acl' 'e2fsprogs' 'exfatprogs' 'dosfstools' 'btrfs-progs' 'xfsprogs')
+optdepends=('mtools: тестовые образы FAT при разработке')
+install=disk-plus.install
+source=("disk-plus-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/disk-plus-${pkgver}"
+  install -d "$pkgdir/usr/lib/disk-plus"
+  cp -r diskplus "$pkgdir/usr/lib/disk-plus/diskplus"
+  find "$pkgdir/usr/lib/disk-plus" -name '__pycache__' -prune -exec rm -rf {} +
+  find "$pkgdir/usr/lib/disk-plus" -type d -exec chmod 755 {} +
+  find "$pkgdir/usr/lib/disk-plus" -type f -exec chmod 644 {} +
+  install -Dm755 lib/diskplus-helper "$pkgdir/usr/lib/disk-plus/diskplus-helper"
+  install -Dm755 bin/disk-plus "$pkgdir/usr/bin/disk-plus"
+  install -Dm644 data/com.local.diskplus.policy "$pkgdir/usr/share/polkit-1/actions/com.local.diskplus.policy"
+  install -Dm644 data/com.local.DiskPlus.desktop "$pkgdir/usr/share/applications/com.local.DiskPlus.desktop"
+  install -Dm644 data/com.local.DiskPlus.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.local.DiskPlus.svg"
+  install -Dm644 data/com.local.DiskPlus.metainfo.xml "$pkgdir/usr/share/metainfo/com.local.DiskPlus.metainfo.xml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/disk-plus/README.md"
+}
