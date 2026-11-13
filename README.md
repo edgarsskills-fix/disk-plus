@@ -28,12 +28,12 @@ file recovery (including after formatting), disk cloning and compressed backups.
 
 ## Установка
 
-- **Arch / CachyOS / Manjaro:** скачайте `Disk++-установщик.run` из раздела [Releases](https://github.com/edgarsskills-fix/disk-plus/releases) и выполните `bash Disk++-установщик.run`.
+- **Arch / CachyOS / Manjaro:** скачайте `disk-plus-installer.run` из раздела [Releases](https://github.com/edgarsskills-fix/disk-plus/releases) и выполните `bash disk-plus-installer.run`.
   Пакет ставится через `pacman -U`, зависимости подтягиваются автоматически.
 - **Debian / Ubuntu / Fedora:** тот же установщик установит зависимости через `apt`/`dnf`
   (**не проверено на этих системах**, нужна libadwaita 1.5 или новее).
 
-Удаление: `bash Disk++-установщик.run --remove` (или `sudo pacman -R disk-plus`).
+Удаление: `bash disk-plus-installer.run --remove` (или `sudo pacman -R disk-plus`).
 
 ## Безопасность
 
