@@ -1,6 +1,6 @@
 # Maintainer: Disk++ authors
 pkgname=disk-plus
-pkgver=1.2.0
+pkgver=1.2.1
 pkgrel=1
 pkgdesc='Disk++: диагностика дисков, образ умирающего диска, восстановление файлов, клонирование и резервные копии'
 arch=('any')

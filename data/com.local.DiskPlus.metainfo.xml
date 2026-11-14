@@ -13,6 +13,9 @@
   <url type="homepage">https://github.com/edgarsskills-fix/disk-plus</url>
   <provides><binary>disk-plus</binary></provides>
   <releases>
+    <release version="1.2.1" date="2026-11-15">
+      <description><p>Зелёная иконка Disk++ для отличия от синей иконки Torrent++ при сохранении общего стиля.</p></description>
+    </release>
     <release version="1.2.0" date="2026-11-15">
       <description><p>Обновлённый интерфейс, поиск накопителей, выбор оформления и новая иконка с символьным вариантом.</p></description>
     </release>
