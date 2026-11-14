@@ -12,6 +12,7 @@ if [ "${1:-}" = "--remove" ]; then
   rm -f /usr/bin/disk-plus /usr/share/polkit-1/actions/com.local.diskplus.policy \
         /usr/share/applications/com.local.DiskPlus.desktop \
         /usr/share/icons/hicolor/scalable/apps/com.local.DiskPlus.svg \
+        /usr/share/icons/hicolor/symbolic/apps/com.local.DiskPlus-symbolic.svg \
         /usr/share/metainfo/com.local.DiskPlus.metainfo.xml
   gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
   update-desktop-database -q /usr/share/applications 2>/dev/null || true
@@ -39,6 +40,7 @@ install -m755 -o root -g root "$here/bin/disk-plus" /usr/bin/disk-plus
 install -Dm644 "$here/data/com.local.diskplus.policy" /usr/share/polkit-1/actions/com.local.diskplus.policy
 install -Dm644 "$here/data/com.local.DiskPlus.desktop" /usr/share/applications/com.local.DiskPlus.desktop
 install -Dm644 "$here/data/com.local.DiskPlus.svg" /usr/share/icons/hicolor/scalable/apps/com.local.DiskPlus.svg
+install -Dm644 "$here/data/com.local.DiskPlus-symbolic.svg" /usr/share/icons/hicolor/symbolic/apps/com.local.DiskPlus-symbolic.svg
 install -Dm644 "$here/data/com.local.DiskPlus.metainfo.xml" /usr/share/metainfo/com.local.DiskPlus.metainfo.xml
 gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database -q /usr/share/applications 2>/dev/null || true

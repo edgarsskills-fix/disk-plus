@@ -102,9 +102,10 @@ class BackupPage(Gtk.Box):
         self.layout = None
         self.dest_dir = DEFAULT_DIR
         self.bar = Gtk.Box(spacing=8)
+        self.bar.add_css_class("dp-step-bar")
         for m in ("start", "end"):
-            getattr(self.bar, f"set_margin_{m}")(14)
-        self.bar.set_margin_top(10)
+            getattr(self.bar, f"set_margin_{m}")(30)
+        self.bar.set_margin_top(0)
         self.bar.set_margin_bottom(4)
         self.back_btn = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Назад", visible=False)
         self.back_btn.add_css_class("flat")
@@ -115,6 +116,8 @@ class BackupPage(Gtk.Box):
         self.bar.append(self.crumb)
         self.append(self.bar)
         self.stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_hhomogeneous(False)
+        self.stack.set_vhomogeneous(False)
         self.append(self.stack)
         self._build_home()
         self._build_create()
@@ -132,6 +135,7 @@ class BackupPage(Gtk.Box):
         self.stack.set_visible_child_name(name)
         self.back_btn.set_visible(name in ("create", "restore"))
         self.crumb.set_label(self.TITLES[name])
+        self.bar.set_visible(name != "home")
         if name == "home":
             self.refresh_list()
 
@@ -157,12 +161,12 @@ class BackupPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
-        sc.set_child(box)
+            getattr(box, f"set_margin_{m}")(30)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700)
+        clamp.set_child(box)
+        sc.set_child(clamp)
         intro = Gtk.Label(wrap=True, xalign=0,
-                          label="Копия сохраняет разделы диска в сжатые файлы с контрольными суммами. "
-                                "Потом её можно проверить, развернуть на другой диск или открыть и достать отдельные файлы. "
-                                "Копируются только занятые данные.")
+                          label="Сжатые копии разделов с контрольными суммами. Копируются только занятые данные.")
         intro.add_css_class("dim-label")
         box.append(intro)
         g = Adw.PreferencesGroup()
@@ -230,8 +234,10 @@ class BackupPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
-        sc.set_child(box)
+            getattr(box, f"set_margin_{m}")(30)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700)
+        clamp.set_child(box)
+        sc.set_child(clamp)
         g = Adw.PreferencesGroup(title="Откуда")
         self.c_src_row = Adw.ComboRow(title="Диск")
         self.c_src_row.connect("notify::selected", lambda *_: self._c_changed())
@@ -332,8 +338,10 @@ class BackupPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
-        sc.set_child(box)
+            getattr(box, f"set_margin_{m}")(30)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700)
+        clamp.set_child(box)
+        sc.set_child(clamp)
         self.r_info = Gtk.Label(xalign=0, wrap=True)
         self.r_info.add_css_class("dim-label")
         box.append(self.r_info)
@@ -572,7 +580,7 @@ class BackupPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
+            getattr(box, f"set_margin_{m}")(30)
         sc.set_child(box)
         self.steps = StepsView()
         box.append(self.steps)

@@ -14,7 +14,7 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .. import devices  # noqa: E402
 from .scan_page import Stat, fmt_time  # noqa: E402
-from .widgets import RESCUE_COLORS, ScanMap, SmoothBar, SpeedGraph, _hex, is_dark  # noqa: E402
+from .widgets import RESCUE_COLORS, ScanMap, SmoothBar, SpeedGraph, _hex, is_dark, map_panel  # noqa: E402
 
 ALLOWED = ("/home/", "/run/media/", "/mnt/", "/media/")
 # символ карты helper-а -> код клетки ScanMap (255 = ещё не пробовали)
@@ -52,11 +52,12 @@ class ImagePage(Gtk.Box):
         self.cur_phase = "copy"
 
         left = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=False)
-        left.set_size_request(360, -1)
+        left.set_size_request(330, -1)
         self.left = left
+        left.add_css_class("dp-control-pane")
         lbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(lbox, f"set_margin_{m}")(18)
+            getattr(lbox, f"set_margin_{m}")(24)
         left.set_child(lbox)
 
         g1 = Adw.PreferencesGroup(title="Откуда")
@@ -76,7 +77,7 @@ class ImagePage(Gtk.Box):
         self.name_row.connect("changed", self._on_changed)
         g2.add(self.name_row)
         self.space_row = Adw.ActionRow(title="Свободное место")
-        self.space_lbl = Gtk.Label(label="—")
+        self.space_lbl = Gtk.Label(label="—", wrap=True, max_width_chars=23, width_chars=18, xalign=1)
         self.space_row.add_suffix(self.space_lbl)
         g2.add(self.space_row)
         lbox.append(g2)
@@ -102,9 +103,7 @@ class ImagePage(Gtk.Box):
         lbox.append(self.resume_note)
 
         note = Gtk.Label(wrap=True, xalign=0,
-                         label="Источник читается только на чтение. Сначала быстро собираются «лёгкие» области, "
-                               "трудные оставляются на потом, поэтому большая часть данных спасается до того, "
-                               "как диск начнёт сыпаться. Копирование можно остановить и продолжить позже.")
+                         label="Источник не изменяется. Копирование можно остановить и продолжить позже.")
         note.add_css_class("caption")
         note.add_css_class("dim-label")
         lbox.append(note)
@@ -150,7 +149,7 @@ class ImagePage(Gtk.Box):
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, hexpand=True)
         for m in ("start", "end", "top", "bottom"):
-            getattr(right, f"set_margin_{m}")(18)
+            getattr(right, f"set_margin_{m}")(24)
         stats = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, column_spacing=10,
                             row_spacing=10, min_children_per_line=2, max_children_per_line=5)
         self.st_done = Stat("Спасено")
@@ -175,7 +174,8 @@ class ImagePage(Gtk.Box):
         right.append(self.progress)
         frame = Gtk.Frame(vexpand=True)
         self.map = ScanMap(palette=RESCUE_COLORS)
-        frame.set_child(self.map)
+        panel, self.map_empty = map_panel(self.map, "Копирование не запущено", "Здесь появится карта сохранённых данных")
+        frame.set_child(panel)
         right.append(frame)
 
         legend = Gtk.Box(spacing=18)
@@ -208,7 +208,7 @@ class ImagePage(Gtk.Box):
     # ---------- адаптивность ----------
     def set_narrow(self, narrow):
         self.set_orientation(Gtk.Orientation.VERTICAL if narrow else Gtk.Orientation.HORIZONTAL)
-        self.left.set_size_request(-1 if narrow else 360, -1)
+        self.left.set_size_request(-1 if narrow else 330, -1)
         self.map.set_size_request(200, 220 if narrow else 160)
 
     # ---------- данные ----------
@@ -333,6 +333,7 @@ class ImagePage(Gtk.Box):
     # ---------- управление ----------
     def set_state(self, st):
         self.state = st
+        self.map_empty.set_visible(st == "idle" and not len(self.map.codes))
         idle = st == "idle"
         self.btn_start.set_visible(idle)
         self.btn_pause.set_visible(not idle)

@@ -38,9 +38,10 @@ class ClonePage(Gtk.Box):
         self.checked = None
 
         self.bar = Gtk.Box(spacing=8)
+        self.bar.add_css_class("dp-step-bar")
         for m in ("start", "end"):
-            getattr(self.bar, f"set_margin_{m}")(14)
-        self.bar.set_margin_top(10)
+            getattr(self.bar, f"set_margin_{m}")(30)
+        self.bar.set_margin_top(0)
         self.bar.set_margin_bottom(4)
         self.back_btn = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Назад", visible=False)
         self.back_btn.add_css_class("flat")
@@ -51,6 +52,8 @@ class ClonePage(Gtk.Box):
         self.bar.append(self.crumb)
         self.append(self.bar)
         self.stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_hhomogeneous(False)
+        self.stack.set_vhomogeneous(False)
         self.append(self.stack)
         self._build_pick()
         self._build_layout()
@@ -76,12 +79,13 @@ class ClonePage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
-        sc.set_child(box)
+            getattr(box, f"set_margin_{m}")(30)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700)
+        clamp.set_child(box)
+        sc.set_child(clamp)
         intro = Gtk.Label(wrap=True, xalign=0,
-                          label="Копия диска целиком: разделы, таблица разделов и данные. Исходный диск не изменяется. "
-                                "Диск назначения будет полностью стёрт. Разделы можно только увеличивать, "
-                                "уменьшать пока нельзя, поэтому новый диск должен вмещать все выбранные разделы.")
+                          label="Перенос выбранных разделов и их данных. Исходный диск не изменяется. "
+                                "Все данные на диске назначения будут удалены.")
         intro.add_css_class("dim-label")
         box.append(intro)
         g = Adw.PreferencesGroup(title="Откуда копируем")
@@ -165,7 +169,7 @@ class ClonePage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
+            getattr(box, f"set_margin_{m}")(30)
         sc.set_child(box)
         self.src_bar = LayoutBar(editable=False)
         box.append(self.src_bar)
@@ -373,7 +377,7 @@ class ClonePage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
+            getattr(box, f"set_margin_{m}")(30)
         sc.set_child(box)
         self.run_title = Gtk.Label(xalign=0, wrap=True)
         self.run_title.add_css_class("title-2")

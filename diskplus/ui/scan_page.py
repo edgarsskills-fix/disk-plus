@@ -8,7 +8,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GObject, Gtk  # noqa: E402
 
 from .. import devices  # noqa: E402
-from .widgets import BUCKET_COLORS, HealthRing, ScanMap, SmoothBar, SpeedGraph, bucket_color, is_dark  # noqa: E402
+from .widgets import BUCKET_COLORS, HealthRing, ScanMap, SmoothBar, SpeedGraph, bucket_color, is_dark, map_panel  # noqa: E402
 
 TH_HDD = [5, 20, 50, 150, 500]
 TH_FLASH = [2, 5, 20, 100, 500]
@@ -57,11 +57,12 @@ class ScanPage(Gtk.Box):
 
         # ---------- левая колонка: настройки ----------
         left = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=False)
-        left.set_size_request(360, -1)
+        left.set_size_request(330, -1)
         self.left = left
+        left.add_css_class("dp-control-pane")
         lbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(lbox, f"set_margin_{m}")(18)
+            getattr(lbox, f"set_margin_{m}")(24)
         left.set_child(lbox)
 
         g = Adw.PreferencesGroup(title="Что проверяем")
@@ -84,8 +85,7 @@ class ScanPage(Gtk.Box):
         lbox.append(g)
 
         note = Gtk.Label(wrap=True, xalign=0,
-                         label="Режим только чтения: ничего не записывается и не переназначается, "
-                               "данные на диске не меняются.")
+                         label="Только чтение. Данные и разметка диска не изменяются.")
         note.add_css_class("caption")
         note.add_css_class("dim-label")
         lbox.append(note)
@@ -126,7 +126,7 @@ class ScanPage(Gtk.Box):
         # ---------- правая часть ----------
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, hexpand=True)
         for m in ("start", "end", "top", "bottom"):
-            getattr(right, f"set_margin_{m}")(18)
+            getattr(right, f"set_margin_{m}")(24)
         self.right = right
 
         stats = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, column_spacing=10,
@@ -145,7 +145,8 @@ class ScanPage(Gtk.Box):
 
         frame = Gtk.Frame()
         self.map = ScanMap()
-        frame.set_child(self.map)
+        panel, self.map_empty = map_panel(self.map, "Проверка не запущена", "Здесь появится карта прочитанных блоков")
+        frame.set_child(panel)
         frame.set_vexpand(True)
         right.append(frame)
 
@@ -201,7 +202,7 @@ class ScanPage(Gtk.Box):
     # ----- адаптивность: вызывается окном -----
     def set_narrow(self, narrow):
         self.set_orientation(Gtk.Orientation.VERTICAL if narrow else Gtk.Orientation.HORIZONTAL)
-        self.left.set_size_request(-1 if narrow else 360, -1)
+        self.left.set_size_request(-1 if narrow else 330, -1)
         self.left.set_vexpand(False)
         self.rsc.set_vexpand(True)
         self.map.set_size_request(200, 220 if narrow else 160)
@@ -256,6 +257,7 @@ class ScanPage(Gtk.Box):
     # ----- управление -----
     def set_state(self, st):
         self.state = st
+        self.map_empty.set_visible(st == "idle" and not len(self.map.codes))
         idle = st == "idle"
         self.btn_start.set_visible(idle)
         self.btn_pause.set_visible(not idle)

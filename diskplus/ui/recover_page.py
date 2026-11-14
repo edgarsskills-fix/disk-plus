@@ -66,9 +66,10 @@ class RecoverPage(Gtk.Box):
 
         # верхняя полоса навигации по шагам
         self.bar = Gtk.Box(spacing=8)
+        self.bar.add_css_class("dp-step-bar")
         for m in ("start", "end"):
-            getattr(self.bar, f"set_margin_{m}")(14)
-        self.bar.set_margin_top(10)
+            getattr(self.bar, f"set_margin_{m}")(30)
+        self.bar.set_margin_top(0)
         self.bar.set_margin_bottom(4)
         self.back_btn = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Назад", visible=False)
         self.back_btn.add_css_class("flat")
@@ -80,6 +81,8 @@ class RecoverPage(Gtk.Box):
         self.append(self.bar)
 
         self.stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_hhomogeneous(False)
+        self.stack.set_vhomogeneous(False)
         self.append(self.stack)
         self._build_source()
         self._build_volumes()
@@ -108,11 +111,12 @@ class RecoverPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
-        sc.set_child(box)
+            getattr(box, f"set_margin_{m}")(30)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700)
+        clamp.set_child(box)
+        sc.set_child(clamp)
         intro = Gtk.Label(wrap=True, xalign=0,
-                          label="Выберите диск или файл образа. Лучше работать с образом, снятым через «Образ диска»: "
-                                "так оригинал не нагружается. Содержимое источника не изменяется.")
+                          label="Выберите накопитель или файл образа. Для повреждённого диска сначала создайте образ.")
         intro.add_css_class("dim-label")
         box.append(intro)
         self.src_disks = Adw.PreferencesGroup(title="Диски")
@@ -197,7 +201,7 @@ class RecoverPage(Gtk.Box):
         sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for m in ("start", "end", "top", "bottom"):
-            getattr(box, f"set_margin_{m}")(18)
+            getattr(box, f"set_margin_{m}")(30)
         sc.set_child(box)
         self.vol_status = Gtk.Label(wrap=True, xalign=0)
         self.vol_status.add_css_class("dim-label")

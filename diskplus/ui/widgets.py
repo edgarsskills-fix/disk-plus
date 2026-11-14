@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import cairo
 import gi
@@ -492,7 +493,27 @@ CSS = """
 """
 
 
+def map_panel(widget, title, description):
+    """A real empty state, replaced by the live block map when a job starts."""
+    overlay = Gtk.Overlay()
+    overlay.set_child(widget)
+    empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                    halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+    empty.add_css_class("dp-map-placeholder")
+    image = Gtk.Image.new_from_icon_name("view-grid-symbolic")
+    image.set_pixel_size(32)
+    empty.append(image)
+    heading = Gtk.Label(label=title, wrap=True, justify=Gtk.Justification.CENTER)
+    heading.add_css_class("heading")
+    empty.append(heading)
+    text = Gtk.Label(label=description, wrap=True, justify=Gtk.Justification.CENTER)
+    text.add_css_class("caption")
+    empty.append(text)
+    overlay.add_overlay(empty)
+    return overlay, empty
+
+
 def install_css():
     prov = Gtk.CssProvider()
-    prov.load_from_string(CSS)
+    prov.load_from_string(CSS + '\n' + Path(__file__).with_name('style.css').read_text())
     Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)

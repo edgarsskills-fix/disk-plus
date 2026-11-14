@@ -1,0 +1,30 @@
+/* Native Adwaita colors are shared with the user's desktop and accent setting. */
+.dp-sidebar { background: alpha(@view_bg_color, .58); }
+.dp-brand { font-size: 25px; font-weight: 800; letter-spacing: -1px; }
+.dp-brand-plus { font-size: 25px; font-weight: 800; color: @accent_color; }
+.dp-version { font-size: 11px; opacity: .5; }
+.dp-nav { background: transparent; }
+.dp-nav row { border-radius: 10px; margin: 3px 10px; padding: 12px 10px; }
+.dp-nav row:selected { background: alpha(@accent_bg_color, .16); color: @accent_color; }
+.dp-nav row:hover { background: alpha(@accent_bg_color, .09); }
+.dp-section { font-size: 10px; font-weight: 700; letter-spacing: 1.3px; opacity: .45; margin: 18px 24px 8px; }
+.dp-page-heading { margin: 8px 30px 24px; }
+.dp-page-title { font-size: 30px; font-weight: 800; letter-spacing: -.8px; }
+.dp-access { border-radius: 12px; }
+.dp-disk-card { background: @card_bg_color; border: 1px solid alpha(@window_fg_color,.065); border-radius: 16px; padding: 22px; }
+.dp-device-icon { padding: 11px; border-radius: 13px; color: @accent_color; background: alpha(@accent_bg_color,.12); }
+.dp-device-title { font-size: 16px; font-weight: 700; }
+.dp-capacity { font-size: 25px; font-weight: 750; letter-spacing: -.5px; font-feature-settings: 'tnum'; }
+.dp-workspace button:not(.flat):not(.circular):not(.image-button) { border-radius: 9px; }
+.dp-workspace preferencesgroup > box > label { font-size: 13px; }
+.dp-control-pane { background: alpha(@view_bg_color,.28); }
+.dp-stat { background: @card_bg_color; border: 1px solid alpha(@window_fg_color,.055); padding: 14px 16px; border-radius: 12px; }
+.dp-stat-num { font-size: 23px; font-weight: 700; font-feature-settings: 'tnum'; }
+.dp-pill { border-radius: 7px; padding: 3px 8px; font-weight: 600; font-size: 11px; }
+.dp-phase { border-radius: 7px; padding: 5px 10px; }
+.dp-scan-page frame, .dp-image-page frame { border-radius: 12px; border-color: alpha(@window_fg_color,.08); padding: 10px; background: alpha(@view_bg_color,.4); }
+.dp-workspace .boxed-list { box-shadow: none; border: 1px solid alpha(@window_fg_color,.055); }
+.dp-step-bar { padding: 0; margin: 0 30px 6px; }
+.dp-disks-page flowboxchild { padding: 0; border-radius: 16px; background: transparent; }
+.dp-map-placeholder { opacity: .5; }
+.dp-map-placeholder image { margin-bottom: 10px; }

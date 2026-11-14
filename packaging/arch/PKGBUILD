@@ -1,6 +1,6 @@
 # Maintainer: Disk++ authors
 pkgname=disk-plus
-pkgver=1.0.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc='Disk++: диагностика дисков, образ умирающего диска, восстановление файлов, клонирование и резервные копии'
 arch=('any')
@@ -26,6 +26,8 @@ package() {
   install -Dm644 data/com.local.diskplus.policy "$pkgdir/usr/share/polkit-1/actions/com.local.diskplus.policy"
   install -Dm644 data/com.local.DiskPlus.desktop "$pkgdir/usr/share/applications/com.local.DiskPlus.desktop"
   install -Dm644 data/com.local.DiskPlus.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.local.DiskPlus.svg"
+  install -Dm644 data/com.local.DiskPlus-symbolic.svg "$pkgdir/usr/share/icons/hicolor/symbolic/apps/com.local.DiskPlus-symbolic.svg"
   install -Dm644 data/com.local.DiskPlus.metainfo.xml "$pkgdir/usr/share/metainfo/com.local.DiskPlus.metainfo.xml"
   install -Dm644 README.md "$pkgdir/usr/share/doc/disk-plus/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/disk-plus/LICENSE"
 }

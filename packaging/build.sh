@@ -6,7 +6,7 @@ ver="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$here/diskplus/__init__.py")"
 dist="$here/dist"; mkdir -p "$dist"
 work="$(mktemp -d)"; trap 'rm -rf "${work:?}"' EXIT
 src="$work/disk-plus-$ver"; mkdir -p "$src"
-cp -r "$here/diskplus" "$here/lib" "$here/bin" "$here/data" "$here/README.md" "$src/"
+cp -r "$here/diskplus" "$here/lib" "$here/bin" "$here/data" "$here/README.md" "$here/LICENSE" "$src/"
 find "$src" -name '__pycache__' -prune -exec rm -rf {} +
 tar -C "$work" -czf "$work/disk-plus-$ver.tar.gz" "disk-plus-$ver"
 mkdir -p "$work/pkg"; cp "$here/packaging/arch/PKGBUILD" "$here/packaging/arch/disk-plus.install" "$work/pkg/"
